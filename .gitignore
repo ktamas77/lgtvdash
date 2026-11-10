@@ -1,0 +1,6 @@
+.lgtv-key
+.env
+docs/worklog/
+.playwright-mcp/
+node_modules/
+.DS_Store

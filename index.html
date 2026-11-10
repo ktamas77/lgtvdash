@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LG TV</title>
+<style>
+  :root { --bg: #f6f6f4; --card: #fff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e4e4df; --ok: #2f7d4f; --bad: #b3412f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --card: #1f1f1d; --fg: #ececea; --muted: #9a9a94; --line: #33332f; --ok: #6cc28e; --bad: #e58a78; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 22px; }
+  h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  button { font: inherit; padding: 6px 14px; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 6px; cursor: pointer; }
+  #status { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .wide { grid-column: 1 / -1; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .bar { display: flex; align-items: center; gap: 8px; }
+  .bar span { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--fg); }
+  .bar input[type=range] { flex: 1; min-width: 0; accent-color: var(--fg); }
+  .bar button { padding: 2px 10px; font-size: 12px; }
+  .on { color: var(--ok); font-weight: 600; }
+  .err { color: var(--bad); }
+  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
+  .app { text-align: center; font-size: 12px; }
+  .app img { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; background: var(--line); display: block; margin: 0 auto 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; color: var(--muted); }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--muted); }
+  pre { font-size: 12px; overflow: auto; max-height: 320px; background: var(--bg); padding: 10px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">LG TV</h1>
+    <div><span id="status">Loading…</span> <button id="reload">Refresh</button></div>
+  </header>
+  <div class="grid" id="grid"></div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "—").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const val = (r, f) => (r?.ok ? f(r.payload) : `<span class="err">${esc(r?.payload)}</span>`);
+const bar = (v) => { const n = Number(v) || 0; return `<div class="bar"><span><i style="width:${Math.min(100, n)}%"></i></span>${n}</div>`; };
+const rows = (pairs) => `<dl>${pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+const card = (title, body, cls = "") => `<section class="card ${cls}"><h2>${title}</h2>${body}</section>`;
+const setting = (r, k) => val(r, (p) => esc(p.settings[k]));
+
+async function load() {
+  $("#status").textContent = "Loading…";
+  try {
+    const res = await fetch("/api/info");
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error);
+    render(d);
+    $("#status").textContent = "Updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+
+function render(d) {
+  const name = d.netSettings.ok ? d.netSettings.payload.settings.deviceName : "LG TV";
+  $("#title").textContent = name;
+  document.title = name;
+  const inputs = d.inputs.ok ? d.inputs.payload.devices : [];
+  const fgApp = d.foreground.ok ? d.foreground.payload.appId : "";
+  const fgInput = inputs.find((i) => i.appId === fgApp);
+  const t = d.time.ok ? d.time.payload.time : null;
+  const pad = (n) => String(Number(n) || 0).padStart(2, "0");
+
+  $("#grid").innerHTML = [
+    card("Status", rows([
+      ["Power", val(d.power, (p) => `<span class="on">${esc(p.state)}</span>`)],
+      ["Showing", val(d.foreground, (p) => esc(fgInput ? `${fgInput.label} (${p.appId})` : p.appId))],
+      ["Volume", val(d.volume, (p) =>
+        `<div class="bar"><input id="vol" type="range" min="0" max="100" value="${Number(p.volume) || 0}" aria-label="Volume"><output id="volOut">${Number(p.volume) || 0}</output>
+         <button id="mute" aria-pressed="${p.muted}">${p.muted ? "Unmute" : "Mute"}</button></div>`)],
+      ["Sound output", val(d.soundOutput, (p) => esc(p.soundOutput))],
+      ["TV clock", t ? `${pad(t.year)}-${pad(t.month)}-${pad(t.day)} ${pad(t.hour)}:${pad(t.minute)}` : val(d.time)],
+    ])),
+    card("Device", rows([
+      ["Model", val(d.system, (p) => esc(p.modelName))],
+      ["Receiver", val(d.system, (p) => esc(p.receiverType))],
+      ["DVR", val(d.system, (p) => esc(p.features?.dvr))],
+      ["Country", setting(d.country, "country")],
+      ["Audio guidance", setting(d.audioGuidance, "audioGuidance")],
+      ["SIMPLINK (HDMI-CEC)", setting(d.simplink, "simplinkEnable")],
+    ])),
+    card("Picture", rows([
+      ["Backlight", val(d.backlight, (p) => bar(p.settings.backlight))],
+      ["Contrast", val(d.contrast, (p) => bar(p.settings.contrast))],
+      ["Brightness", val(d.brightness, (p) => bar(p.settings.brightness))],
+      ["Color", val(d.color, (p) => bar(p.settings.color))],
+    ]) + `<p style="color:var(--muted);margin:10px 0 0;font-size:12px">Read-only: the TV refuses picture changes from third-party apps (401). Picture mode, sharpness, color temperature and energy saving are not readable either.</p>`),
+    card("Network", rows([
+      ["Wi-Fi MAC", val(d.network, (p) => esc(p.wifiInfo?.macAddress))],
+      ["Wired MAC", val(d.network, (p) => esc(p.wiredInfo?.macAddress))],
+      ["Wi-Fi Direct MAC", val(d.network, (p) => esc(p.P2PInfo?.macAddress))],
+      ["Wake-on-LAN", val(d.netSettings, (p) => esc(p.settings.wolwowlOnOff))],
+    ])),
+    card("Inputs", `<table>${inputs.map((i) =>
+      `<tr><td>${i.appId === fgApp ? "▶ " : ""}${esc(i.label)}</td><td class="${i.connected ? "on" : ""}">${i.connected ? "connected" : "—"}</td></tr>`
+    ).join("") || `<tr><td>${val(d.inputs)}</td></tr>`}</table>`),
+    card("Services", val(d.services, (p) => p.services.map((s) => `${esc(s.name)} v${esc(s.version)}`).join(", "))),
+    card(`Apps (${d.apps.ok ? d.apps.payload.launchPoints.length : "?"})`, val(d.apps, (p) =>
+      `<div class="apps">${p.launchPoints.map((a) =>
+        `<div class="app"><img loading="lazy" alt="" src="${esc(a.mediumLargeIcon?.startsWith("http") ? a.mediumLargeIcon : a.icon)}">${esc(a.title)}</div>`
+      ).join("")}</div>`), "wide"),
+    card("Model config (tv.model.*)", val(d.config, (p) =>
+      `<details><summary>${Object.keys(p.configs).length} flags</summary><pre>${esc(JSON.stringify(p.configs, null, 2))}</pre></details>`), "wide"),
+    card("Raw responses", `<details><summary>All ${Object.keys(d).length} calls</summary><pre>${esc(JSON.stringify(d, null, 2))}</pre></details>`, "wide"),
+  ].join("");
+
+  const vol = $("#vol"), mute = $("#mute");
+  if (vol) {
+    vol.oninput = () => ($("#volOut").textContent = vol.value);
+    vol.onchange = () => setVolume({ volume: Number(vol.value) });
+    mute.onclick = async () => {
+      const next = mute.getAttribute("aria-pressed") !== "true";
+      if (await setVolume({ muted: next })) {
+        mute.setAttribute("aria-pressed", next);
+        mute.textContent = next ? "Unmute" : "Mute";
+      }
+    };
+  }
+}
+
+// ponytail: sends on release (change), not on every drag step; the TV is slow per call.
+async function setVolume(body) {
+  $("#status").textContent = "Sending…";
+  try {
+    const res = await fetch("/api/volume", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(r.error ?? r.payload ?? res.statusText);
+    $("#status").textContent = "Set " + new Date().toLocaleTimeString();
+    return true;
+  } catch (e) {
+    $("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    return false;
+  }
+}
+
+$("#reload").onclick = load;
+load();
+</script>
+</body>
+</html>
