@@ -87,7 +87,7 @@ function render(d) {
       ["Showing", val(d.foreground, (p) => esc(fgInput ? `${fgInput.label} (${p.appId})` : p.appId))],
       ["Volume", val(d.volume, (p) =>
         `<div class="bar"><input id="vol" type="range" min="0" max="100" value="${Number(p.volume) || 0}" aria-label="Volume"><output id="volOut">${Number(p.volume) || 0}</output>
-         <button id="mute" aria-pressed="${p.muted}">${p.muted ? "Unmute" : "Mute"}</button></div>`)],
+         <button id="mute" aria-pressed="${p.muted === true}">${p.muted ? "Unmute" : "Mute"}</button></div>`)],
       ["Sound output", val(d.soundOutput, (p) => esc(p.soundOutput))],
       ["TV clock", t ? `${pad(t.year)}-${pad(t.month)}-${pad(t.day)} ${pad(t.hour)}:${pad(t.minute)}` : val(d.time)],
     ])),

@@ -45,9 +45,17 @@ createServer(async (req, res) => {
     return;
   }
   if (req.url === "/api/volume" && req.method === "POST") {
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    const { volume, muted } = JSON.parse(body || "{}");
+    // CSRF guard: other sites can't send JSON without a CORS preflight, and browsers always send Origin on POST.
+    const origin = req.headers.origin;
+    if ((origin && origin !== `http://${req.headers.host}`) || !req.headers["content-type"]?.startsWith("application/json"))
+      return res.writeHead(403).end();
+    let body = "", volume: any, muted: any;
+    try {
+      for await (const chunk of req) if ((body += chunk).length > 1024) throw new Error("too large");
+      ({ volume, muted } = JSON.parse(body || "{}"));
+    } catch {
+      return res.writeHead(400).end("bad request body");
+    }
     const reqs: Req[] = [];
     if (Number.isInteger(volume) && volume >= 0 && volume <= 100) reqs.push(["ssap://audio/setVolume", { volume }]);
     if (typeof muted === "boolean") reqs.push(["ssap://audio/setMute", { mute: muted }]);
