@@ -56,6 +56,7 @@
   <header>
     <h1 id="title">LG TV</h1>
     <div class="actions"><span id="status">Loading…</span>
+      <select id="tv" aria-label="TV"></select><button id="scan">Scan</button>
       <button data-cmd="powerOn">Power on</button><button data-cmd="powerOff">Power off</button>
       <button id="reload">Refresh</button></div>
   </header>
@@ -70,21 +71,64 @@ const rows = (pairs) => `<dl>${pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>
 const card = (title, body, cls = "") => `<section class="card ${cls}"><h2>${title}</h2>${body}</section>`;
 const setting = (r, k) => val(r, (p) => esc(p.settings[k]));
 
+let tvs = [], current = null;
+// Remember the chosen TV per browser. Storage can be unavailable (private mode), so it's best effort.
+const remembered = () => { try { return localStorage.getItem("tv"); } catch { return null; } };
+const remember = (host) => { try { localStorage.setItem("tv", host); } catch {} };
+const tvName = (t) => t?.name ?? t?.host ?? "LG TV";
+
+async function loadTvs(scan = false) {
+  if (scan) $("#status").textContent = "Scanning…";
+  const res = await (scan
+    ? fetch("/api/scan", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+    : fetch("/api/tvs"));
+  tvs = await res.json();
+  if (!tvs.some((t) => t.host === current))
+    current = (tvs.find((t) => t.host === remembered()) ?? tvs.find((t) => t.online) ?? tvs[0])?.host ?? null;
+  $("#tv").innerHTML = tvs.map((t) =>
+    `<option value="${esc(t.host)}"${t.host === current ? " selected" : ""}>${t.online ? "● " : "○ "}${esc(tvName(t))} (${esc(t.host)})</option>`
+  ).join("") || "<option>No TVs</option>";
+  $("#tv").disabled = !tvs.length;
+}
+
+// Shown even when the selected TV is off, so you can switch TVs or power it on.
+function tvsCard() {
+  return card(`TVs (${tvs.length})`, tvs.length ? `<table>${tvs.map((t) =>
+    `<tr><td><button class="link" data-select="${esc(t.host)}">${t.host === current ? "▶ " : ""}${esc(tvName(t))}</button>
+       <div style="color:var(--muted);font-size:12px">${esc(t.host)} · ${esc(t.model)} · ${esc(t.mac ?? "no MAC")}</div></td>
+     <td>${t.sources.map(esc).join(" + ")}<br>${t.online ? '<span class="on">on network</span>' : "not seen"}${t.paired ? "" : " · not paired"}</td></tr>`
+  ).join("")}</table>` : `<p>No TVs yet. Press <b>Scan</b> with the TV on, or add one to <code>tvs.json</code>.</p>`);
+}
+
 async function load() {
-  $("#status").textContent = "Loading…";
+  const t = tvs.find((t) => t.host === current);
+  $("#title").textContent = document.title = tvName(t);
+  if (!t) {
+    $("#grid").innerHTML = tvsCard();
+    $("#status").textContent = "";
+    return;
+  }
+  $("#status").textContent = t.paired ? "Loading…" : "Connecting… (first time: accept the pairing prompt on the TV)";
+  // Never show one TV's data under another TV's name while the new one loads (an offline TV takes ~10s to fail).
+  if ($("#grid").dataset.tv !== t.host) $("#grid").innerHTML = tvsCard();
+  $("#grid").dataset.tv = t.host;
   try {
-    const res = await fetch("/api/info");
+    const res = await fetch("/api/info?tv=" + encodeURIComponent(t.host));
     const d = await res.json();
     if (!res.ok) throw new Error(d.error);
+    if (t.host !== current) return; // switched TVs while this was loading
     render(d);
     $("#status").textContent = "Updated " + new Date().toLocaleTimeString();
+    if (!t.paired) loadTvs();
   } catch (e) {
-    $("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    if (t.host !== current) return;
+    $("#grid").innerHTML = tvsCard() + card("Not reachable", `<p class="err">${esc(e.message)}</p><p>The TV may be off. Use <b>Power on</b> if it has a MAC.</p>`);
+    $("#status").textContent = "";
   }
 }
 
 function render(d) {
-  const name = d.netSettings.ok ? d.netSettings.payload.settings.deviceName : "LG TV";
+  const name = d.netSettings.ok ? d.netSettings.payload.settings.deviceName : tvName(tvs.find((t) => t.host === current));
   $("#title").textContent = name;
   document.title = name;
   const inputs = d.inputs.ok ? d.inputs.payload.devices : [];
@@ -135,6 +179,7 @@ function render(d) {
       ${[["rewind", "⏪", "Rewind"], ["play", "▶", "Play"], ["pause", "⏸", "Pause"], ["stop", "⏹", "Stop"], ["fastForward", "⏩", "Fast forward"]]
         .map(([m, s, l]) => `<button data-cmd="media" data-arg="${m}" aria-label="${l}">${s}</button>`).join("")}
     </div>`),
+    tvsCard(),
     card("Services", val(d.services, (p) => p.services.map((s) => `${esc(s.name)} v${esc(s.version)}`).join(", "))),
     card(`Apps (${d.apps.ok ? d.apps.payload.launchPoints.length : "?"})`, val(d.apps, (p) =>
       `<div class="apps">${p.launchPoints.map((a) =>
@@ -163,7 +208,7 @@ function render(d) {
 async function cmd(action, arg) {
   $("#status").textContent = "Sending…";
   try {
-    const res = await fetch("/api/cmd", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, arg }) });
+    const res = await fetch("/api/cmd", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tv: current, action, arg }) });
     const r = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(r.error ?? res.statusText);
     $("#status").textContent = "Sent " + new Date().toLocaleTimeString();
@@ -175,17 +220,29 @@ async function cmd(action, arg) {
 }
 
 // Any element with data-cmd sends that action; input/app/power changes refresh the view afterwards.
+const select = (host) => {
+  current = host;
+  remember(host);
+  $("#tv").value = host;
+  load();
+};
+$("#tv").onchange = () => select($("#tv").value);
+$("#scan").onclick = async () => { await loadTvs(true); load(); };
+
 document.addEventListener("click", async (e) => {
+  const pick = e.target.closest("[data-select]");
+  if (pick) return select(pick.dataset.select);
   const el = e.target.closest("[data-cmd]");
   if (!el) return;
   const { cmd: action, arg } = el.dataset;
-  if (action === "powerOff" && !confirm("Turn the TV off?")) return;
+  if (!current) return;
+  if (action === "powerOff" && !confirm(`Turn off ${tvName(tvs.find((t) => t.host === current))}?`)) return;
   if (await cmd(action, arg) && ["input", "launch", "powerOff", "powerOn"].includes(action))
     setTimeout(load, action === "powerOn" ? 8000 : 1500);
 });
 
 $("#reload").onclick = load;
-load();
+loadTvs().then(load, (e) => ($("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`));
 </script>
 </body>
 </html>

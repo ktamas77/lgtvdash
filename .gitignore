@@ -1,5 +1,7 @@
 .lgtv-key
+.lgtv-state.json
 .env
+tvs.json
 docs/worklog/
 .playwright-mcp/
 node_modules/

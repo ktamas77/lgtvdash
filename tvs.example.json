@@ -1,0 +1,4 @@
+[
+  { "name": "Living room", "host": "192.168.1.20", "mac": "aa:bb:cc:dd:ee:ff" },
+  { "name": "Bedroom", "host": "192.168.1.21" }
+]
