@@ -30,8 +30,18 @@
   .bar button { padding: 2px 10px; font-size: 12px; }
   .on { color: var(--ok); font-weight: 600; }
   .err { color: var(--bad); }
+  .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  button:hover { border-color: var(--muted); }
+  button:active { transform: translateY(1px); }
+  button.link { border: 0; background: none; padding: 0; text-align: left; }
+  button.link:hover { text-decoration: underline; }
+  .remote { display: grid; grid-template-columns: repeat(3, 64px); gap: 6px; justify-content: center; }
+  .remote button { height: 44px; padding: 0; }
+  .media { display: flex; gap: 6px; justify-content: center; margin-top: 12px; }
+  .media button { width: 44px; padding: 6px 0; }
   .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
-  .app { text-align: center; font-size: 12px; }
+  .app { text-align: center; font-size: 12px; border: 0; background: none; padding: 4px; border-radius: 8px; }
+  .app:hover { background: var(--line); }
   .app img { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; background: var(--line); display: block; margin: 0 auto 4px; }
   table { width: 100%; border-collapse: collapse; }
   td { padding: 4px 0; border-bottom: 1px solid var(--line); }
@@ -45,7 +55,9 @@
 <main>
   <header>
     <h1 id="title">LG TV</h1>
-    <div><span id="status">Loading…</span> <button id="reload">Refresh</button></div>
+    <div class="actions"><span id="status">Loading…</span>
+      <button data-cmd="powerOn">Power on</button><button data-cmd="powerOff">Power off</button>
+      <button id="reload">Refresh</button></div>
   </header>
   <div class="grid" id="grid"></div>
 </main>
@@ -112,12 +124,21 @@ function render(d) {
       ["Wake-on-LAN", val(d.netSettings, (p) => esc(p.settings.wolwowlOnOff))],
     ])),
     card("Inputs", `<table>${inputs.map((i) =>
-      `<tr><td>${i.appId === fgApp ? "▶ " : ""}${esc(i.label)}</td><td class="${i.connected ? "on" : ""}">${i.connected ? "connected" : "—"}</td></tr>`
+      `<tr><td><button class="link" data-cmd="input" data-arg="${esc(i.id)}">${i.appId === fgApp ? "▶ " : ""}${esc(i.label)}</button></td><td class="${i.connected ? "on" : ""}">${i.connected ? "connected" : "—"}</td></tr>`
     ).join("") || `<tr><td>${val(d.inputs)}</td></tr>`}</table>`),
+    card("Remote", `<div class="remote">
+      <span></span><button data-cmd="button" data-arg="UP" aria-label="Up">▲</button><span></span>
+      <button data-cmd="button" data-arg="LEFT" aria-label="Left">◀</button><button data-cmd="button" data-arg="ENTER">OK</button><button data-cmd="button" data-arg="RIGHT" aria-label="Right">▶</button>
+      <span></span><button data-cmd="button" data-arg="DOWN" aria-label="Down">▼</button><span></span>
+      <button data-cmd="button" data-arg="BACK">Back</button><button data-cmd="button" data-arg="HOME">Home</button><button data-cmd="button" data-arg="MENU">Settings</button>
+    </div><div class="media">
+      ${[["rewind", "⏪", "Rewind"], ["play", "▶", "Play"], ["pause", "⏸", "Pause"], ["stop", "⏹", "Stop"], ["fastForward", "⏩", "Fast forward"]]
+        .map(([m, s, l]) => `<button data-cmd="media" data-arg="${m}" aria-label="${l}">${s}</button>`).join("")}
+    </div>`),
     card("Services", val(d.services, (p) => p.services.map((s) => `${esc(s.name)} v${esc(s.version)}`).join(", "))),
     card(`Apps (${d.apps.ok ? d.apps.payload.launchPoints.length : "?"})`, val(d.apps, (p) =>
       `<div class="apps">${p.launchPoints.map((a) =>
-        `<div class="app"><img loading="lazy" alt="" src="${esc(a.mediumLargeIcon?.startsWith("http") ? a.mediumLargeIcon : a.icon)}">${esc(a.title)}</div>`
+        `<button class="app" data-cmd="launch" data-arg="${esc(a.id)}"><img loading="lazy" alt="" src="${esc(a.mediumLargeIcon?.startsWith("http") ? a.mediumLargeIcon : a.icon)}">${a.id === fgApp ? "▶ " : ""}${esc(a.title)}</button>`
       ).join("")}</div>`), "wide"),
     card("Model config (tv.model.*)", val(d.config, (p) =>
       `<details><summary>${Object.keys(p.configs).length} flags</summary><pre>${esc(JSON.stringify(p.configs, null, 2))}</pre></details>`), "wide"),
@@ -127,10 +148,11 @@ function render(d) {
   const vol = $("#vol"), mute = $("#mute");
   if (vol) {
     vol.oninput = () => ($("#volOut").textContent = vol.value);
-    vol.onchange = () => setVolume({ volume: Number(vol.value) });
+    // ponytail: sends on release (change), not on every drag step; the TV is slow per call.
+    vol.onchange = () => cmd("volume", Number(vol.value));
     mute.onclick = async () => {
       const next = mute.getAttribute("aria-pressed") !== "true";
-      if (await setVolume({ muted: next })) {
+      if (await cmd("mute", next)) {
         mute.setAttribute("aria-pressed", next);
         mute.textContent = next ? "Unmute" : "Mute";
       }
@@ -138,20 +160,29 @@ function render(d) {
   }
 }
 
-// ponytail: sends on release (change), not on every drag step; the TV is slow per call.
-async function setVolume(body) {
+async function cmd(action, arg) {
   $("#status").textContent = "Sending…";
   try {
-    const res = await fetch("/api/volume", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetch("/api/cmd", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, arg }) });
     const r = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(r.error ?? r.payload ?? res.statusText);
-    $("#status").textContent = "Set " + new Date().toLocaleTimeString();
+    if (!res.ok) throw new Error(r.error ?? res.statusText);
+    $("#status").textContent = "Sent " + new Date().toLocaleTimeString();
     return true;
   } catch (e) {
     $("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
     return false;
   }
 }
+
+// Any element with data-cmd sends that action; input/app/power changes refresh the view afterwards.
+document.addEventListener("click", async (e) => {
+  const el = e.target.closest("[data-cmd]");
+  if (!el) return;
+  const { cmd: action, arg } = el.dataset;
+  if (action === "powerOff" && !confirm("Turn the TV off?")) return;
+  if (await cmd(action, arg) && ["input", "launch", "powerOff", "powerOn"].includes(action))
+    setTimeout(load, action === "powerOn" ? 8000 : 1500);
+});
 
 $("#reload").onclick = load;
 load();

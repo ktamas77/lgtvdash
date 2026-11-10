@@ -74,6 +74,34 @@ export function ask(reqs: Req[], timeoutMs = 90_000): Promise<Res[]> {
   });
 }
 
+// Remote-control button press via the TV's pointer socket (UP, DOWN, LEFT, RIGHT, ENTER, BACK, HOME, ...).
+// ponytail: fresh socket per press (~2 round trips). Keep it open if you need fast key repeat.
+export async function button(name: string): Promise<void> {
+  const [r] = await ask([["ssap://com.webos.service.networkinput/getPointerInputSocket"]], 10_000);
+  if (!r.ok) throw new Error(`pointer socket: ${r.payload}`);
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(r.payload.socketPath);
+    ws.onerror = () => reject(new Error("pointer socket connection failed"));
+    ws.onopen = () => {
+      ws.send(`type:button\nname:${name}\n\n`);
+      setTimeout(() => (ws.close(), resolve()), 100); // let the frame flush before closing
+    };
+  });
+}
+
+// Power on: Wake-on-LAN magic packet (needs "Turn on via Wi-Fi/LAN" enabled on the TV).
+export async function wake(mac: string, broadcast = "255.255.255.255"): Promise<void> {
+  const hex = mac.replace(/[^0-9a-f]/gi, "");
+  if (hex.length !== 12) throw new Error("LGTV_MAC must be a MAC address like aa:bb:cc:dd:ee:ff");
+  const packet = Buffer.from("ff".repeat(6) + hex.repeat(16), "hex");
+  const { createSocket } = await import("node:dgram");
+  const sock = createSocket("udp4");
+  await new Promise<void>((resolve, reject) => sock.bind(() => {
+    sock.setBroadcast(true);
+    sock.send(packet, 9, broadcast, (e) => (sock.close(), e ? reject(e) : resolve()));
+  }));
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [uri = "ssap://system/getSystemInfo", payload = "{}"] = process.argv.slice(2);
   const [r] = await ask([[uri, JSON.parse(payload)]]).catch((e) => {
