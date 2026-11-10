@@ -66,14 +66,12 @@ test("keeps one key per TV and sends each TV its own", async () => {
   assert.deepEqual(loadState().keys, { "tv1.test": "key-1", "tv2.test": "key-2" });
 });
 
-test("migrates the legacy single-TV key once, then never offers it to another TV", async () => {
-  writeFileSync(LEGACY, "legacy-key\n");
-  FakeTV.script = (m) => (m.type === "register" ? [registered(m.payload["client-key"] ?? "fresh")] : [ok(m)]);
-  await ask("tv1.test", [["ssap://a"]], 1000);
-  assert.equal(sentKey(0), "legacy-key");
-  assert.deepEqual(loadState().keys, { "tv1.test": "legacy-key" });
-  await ask("tv2.test", [["ssap://a"]], 1000);
-  assert.equal(sentKey(1), undefined);
+test("never sends a key to a host it wasn't issued by (a spoofed SSDP answer gets nothing)", async () => {
+  writeFileSync(LEGACY, "old-single-tv-key\n"); // pre-multi-TV key file is ignored, never migrated
+  writeFileSync(STATE, JSON.stringify({ keys: { "tv1.test": "key-1" } }));
+  FakeTV.script = (m) => (m.type === "register" ? [registered("fresh")] : [ok(m)]);
+  await ask("spoof.test", [["ssap://a"]], 1000);
+  assert.equal(sentKey(0), undefined);
 });
 
 test("maps TV errors and returnValue:false to ok:false", async () => {

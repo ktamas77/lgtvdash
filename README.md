@@ -102,7 +102,7 @@ functions. Keys go to a temp state file (`LGTV_STATE`).
 - It rejects foreign `Host` headers (DNS rebinding) and cross-origin or non-JSON POSTs (CSRF).
 - It only connects to TVs from `tvs.json` or discovery, never to a host named in a request, and only
   fetches a discovered TV's description URL when it points back at the IP that answered.
-- Keys are per TV: one TV's key is never offered to another.
+- Keys are per TV and only sent to the host that issued them, so a device spoofing SSDP answers never gets one.
 - TV traffic, including the client key, is plain `ws://` on the LAN. The TV also serves `wss://` on 3001
   with a self-signed certificate, which Node's built-in WebSocket rejects.
 

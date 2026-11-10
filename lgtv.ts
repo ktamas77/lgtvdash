@@ -4,13 +4,11 @@
 //   node lgtv.ts                                     -> system info of the first TV found (pairs on first run)
 //   LGTV_HOST=<ip> node lgtv.ts ssap://audio/setVolume '{"volume":10}'
 // Pairing pops a prompt on the TV; granted keys are kept per TV in .lgtv-state.json.
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
-import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const STATE = process.env.LGTV_STATE ?? fileURLToPath(new URL(".lgtv-state.json", import.meta.url));
-const LEGACY_KEY = join(dirname(STATE), ".lgtv-key"); // single-TV key file from before multi-TV support
 
 // Asked for up front: adding a permission later means a new prompt on the TV.
 const permissions = [
@@ -44,12 +42,8 @@ export function saveState(update: (s: State) => void) {
 }
 
 // ponytail: keys are per IP, so a TV that changes IP asks to pair again. Key by discovery id if that bites.
-// The legacy single-TV key is only tried before any per-TV key exists, so it is never offered to a second TV.
-const keyFor = (host: string) => {
-  const { keys } = loadState();
-  if (keys[host] || Object.keys(keys).length) return keys[host];
-  return existsSync(LEGACY_KEY) ? readFileSync(LEGACY_KEY, "utf8").trim() || undefined : undefined;
-};
+// A key is only ever sent to the host it was issued by (discovery answers are unauthenticated).
+const keyFor = (host: string): string | undefined => loadState().keys[host];
 
 // One connection: register, send every request, resolve once all have answered.
 // Fails only if it never gets registered; after that, unanswered requests come back as ok:false.
