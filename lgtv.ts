@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const HOST = process.env.LGTV_HOST;
 if (!HOST) throw new Error("Set LGTV_HOST to the TV's IP (e.g. in .env, see README)");
-const KEYFILE = new URL(".lgtv-key", import.meta.url);
+const KEYFILE = process.env.LGTV_KEYFILE ?? new URL(".lgtv-key", import.meta.url);
 
 // Asked for up front: adding a permission later means a new prompt on the TV.
 const permissions = [
@@ -90,10 +90,14 @@ export async function button(name: string): Promise<void> {
 }
 
 // Power on: Wake-on-LAN magic packet (needs "Turn on via Wi-Fi/LAN" enabled on the TV).
-export async function wake(mac: string, broadcast = "255.255.255.255"): Promise<void> {
+export function magicPacket(mac: string): Buffer {
   const hex = mac.replace(/[^0-9a-f]/gi, "");
   if (hex.length !== 12) throw new Error("LGTV_MAC must be a MAC address like aa:bb:cc:dd:ee:ff");
-  const packet = Buffer.from("ff".repeat(6) + hex.repeat(16), "hex");
+  return Buffer.from("ff".repeat(6) + hex.repeat(16), "hex");
+}
+
+export async function wake(mac: string, broadcast = "255.255.255.255"): Promise<void> {
+  const packet = magicPacket(mac);
   const { createSocket } = await import("node:dgram");
   const sock = createSocket("udp4");
   await new Promise<void>((resolve, reject) => sock.bind(() => {

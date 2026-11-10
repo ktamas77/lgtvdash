@@ -17,7 +17,7 @@ LGTV_HOST=<tv-ip>
 LGTV_MAC=<tv-mac>
 LGTV_BROADCAST=<subnet-broadcast>
 EOF
-node --env-file=.env server.ts        # http://localhost:8787
+npm start        # node --env-file=.env server.ts -> http://localhost:8787
 ```
 
 | Variable | Required | Purpose |
@@ -60,6 +60,15 @@ Probed on a 2019 webOS TV with an unsigned client manifest:
 | System info, power state, volume, sound output, foreground app, TV clock, network MACs, input list, app list and app info, 3D status, config flags (`tv.model.*`, `tv.hw.*`, `tv.config.*`, `tv.conti.*`, `tv.rmm.*`, `system.*`) | Firmware version (`401`) |
 | Settings reads: backlight, contrast, brightness, color, country, audio guidance, store mode, device name, Wake-on-LAN, SIMPLINK | Picture mode and other picture options, sound mode, time zone, parental lock (`500`) |
 | Volume, mute, sound output, input switch, app launch, remote buttons, media keys, power off | Any `setSystemSettings` write, picture included (`401`) |
+
+## Tests
+
+```sh
+npm test         # node --test, no TV needed
+```
+
+The client tests replace `WebSocket` with a scripted fake TV; the server tests run the HTTP handler
+on a random port with fake TV functions. The pairing key goes to a temp file (`LGTV_KEYFILE`).
 
 ## Security
 

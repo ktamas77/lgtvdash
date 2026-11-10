@@ -1,0 +1,11 @@
+{
+  "name": "lgtvdash",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --env-file=.env server.ts",
+    "test": "node --test"
+  }
+}
