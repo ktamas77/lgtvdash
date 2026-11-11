@@ -60,8 +60,17 @@ test("first contact: pairs over wss, pins the certificate, saves the key", async
   const s = await connect(T1, { timeoutMs: 1000 });
   assert.equal(FakeConn.conns[0].url, "wss://10.0.0.5:3001");
   assert.equal(registerOf().payload["client-key"], undefined);
-  assert.deepEqual(loadState().tvs["uuid-1"], { host: "10.0.0.5", cert: "AA:AA", key: "k1" });
+  assert.deepEqual(loadState().tvs["uuid-1"], { host: "10.0.0.5", cert: "AA:AA", key: "k1", locked: true });
   s.close();
+});
+
+test("requirePinned (unverified address): fails closed without a pinned certificate, never registers", async () => {
+  await assert.rejects(connect({ id: "uuid-1", host: "10.0.0.66" }, { timeoutMs: 1000, requirePinned: true }), CertChangedError);
+  assert.equal(FakeConn.conns.length, 0); // not even a TLS connection
+  seed({ "uuid-1": { host: "10.0.0.5", cert: "AA:AA", key: "k1" } });
+  FakeConn.cert = "EV:IL";
+  await assert.rejects(connect({ id: "uuid-1", host: "10.0.0.66" }, { timeoutMs: 1000, requirePinned: true }), CertChangedError);
+  assert.equal(registerOf(), undefined);
 });
 
 test("matching certificate: the saved key is sent", async () => {
@@ -197,9 +206,9 @@ test("v1 state migrates: keys move onto their TV, entries re-keyed by uuid", () 
   assert.deepEqual(s, {
     version: 2,
     tvs: {
-      "uuid-1": { host: "10.0.0.5", uuid: "uuid-1", name: "TV", mac: "aa:aa:aa:aa:aa:aa", key: "k1" },
+      "uuid-1": { host: "10.0.0.5", uuid: "uuid-1", name: "TV", mac: "aa:aa:aa:aa:aa:aa", key: "k1", locked: true },
       "host:10.0.0.6": { host: "10.0.0.6" },
-      "host:10.0.0.7": { host: "10.0.0.7", key: "k7" },
+      "host:10.0.0.7": { host: "10.0.0.7", key: "k7", locked: true },
     },
   });
   writeFileSync(STATE, JSON.stringify({ keys: { "10.0.0.5": "k1" }, tvs: { "10.0.0.5": { host: "10.0.0.5", id: "uuid-1" } } }));

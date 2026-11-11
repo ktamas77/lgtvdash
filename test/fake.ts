@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.LGTV_STATE = join(mkdtempSync(join(tmpdir(), "lgtv-fake-")), "state.json");
-const { CertChangedError } = await import("../lgtv.ts");
+const { CertChangedError, loadState } = await import("../lgtv.ts");
 const { registry } = await import("../tvs.ts");
 
 export const TV1 = { host: "10.0.0.5", uuid: "uuid-1", name: "Living room TV", model: "M1", mac: "aa:aa:aa:aa:aa:aa" };
@@ -41,8 +41,9 @@ export const tv = {
   badCert: new Set<string>(), // hosts presenting a different certificate than the pinned one
   answer: (_uri: string, _payload?: object): { ok: boolean; payload: any } => ({ ok: true, payload: {} }),
   deps: {
-    connect: async (target: { id: string; host: string }) => {
+    connect: async (target: { id: string; host: string }, opts: { requirePinned?: boolean } = {}) => {
       tv.connects.push(target);
+      if (opts.requirePinned && !loadState().tvs[target.id]?.cert) throw new CertChangedError("no pinned certificate");
       if (tv.down || tv.unreachable.has(target.host)) throw new Error("connection failed: unreachable");
       if (tv.certChanged || tv.badCert.has(target.host)) throw new CertChangedError(`certificate changed for ${target.id}`);
       const s = new FakeSession(target);

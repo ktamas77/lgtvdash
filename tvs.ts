@@ -69,12 +69,12 @@ export function loadConfig(path: string): ConfigTv[] {
   });
 }
 
-// Fold one discovery result into the state. SSDP answers are unauthenticated, so a known TV's uuid
-// showing up at a new IP never moves it by itself:
-// - pinned certificate: the new IP is only recorded as `movedTo`; the TV's address (and everything else)
-//   changes only after that IP passes the certificate check (registry.session()). A spoofer can't, so it
-//   can't redirect the TV or a later re-pair.
-// - no pinned certificate: nothing to verify against, so the key is dropped and the TV must re-pair.
+// Fold one discovery result into the state. SSDP answers are unauthenticated, so they never move a TV
+// that has ever been paired (locked) or has a pinned certificate: a new IP is only recorded as `movedTo`,
+// and the TV's address (and name, MAC, ...) changes only after that IP presents the pinned certificate
+// (registry.session()). A spoofer can't, so it can't redirect the TV or steer a re-pair; a TV that was
+// re-paired (no certificate now, still locked) re-pairs at its verified address only.
+// A TV that was never paired just follows discovery: there is nothing to protect yet.
 export function absorbFound(s: State, f: Found, now = new Date().toISOString()) {
   const id = tvIdOf(f);
   let rec = s.tvs[id];
@@ -83,14 +83,11 @@ export function absorbFound(s: State, f: Found, now = new Date().toISOString()) 
     rec = s.tvs[byHost]; // paired before discovery knew its uuid: same address, same TV
     delete s.tvs[byHost];
   }
-  if (rec && rec.host !== f.host && rec.cert) {
+  if (rec && rec.host !== f.host && (rec.cert || rec.locked || rec.key)) {
     s.tvs[id] = { ...rec, seenAt: now, movedTo: f.host };
     return;
   }
-  s.tvs[id] = defined({
-    ...rec, ...defined(f), seenAt: now, movedTo: undefined,
-    key: rec && rec.host !== f.host ? undefined : rec?.key,
-  });
+  s.tvs[id] = defined({ ...rec, ...defined(f), seenAt: now, movedTo: undefined });
 }
 
 // YouTube URL (watch, youtu.be, shorts, live, embed; www/m/music hosts) or a bare 11-char id -> video id.
@@ -219,11 +216,13 @@ export function registry({ deps = { connect, discover, wake } as Deps, config = 
     try {
       return await deps.connect({ id: t.id, host: t.host }, { timeoutMs: 60_000 });
     } catch (e) {
-      const movedTo = loadState().tvs[t.id]?.movedTo;
-      if (!movedTo || e instanceof CertChangedError) throw e;
+      const rec = loadState().tvs[t.id];
+      // Only a pinned certificate can vouch for a new address; without one, stay at the verified address.
+      if (!rec?.movedTo || !rec.cert || e instanceof CertChangedError) throw e;
+      const movedTo = rec.movedTo;
       debug("trying address from discovery", t.id, movedTo);
       try {
-        const s = await deps.connect({ id: t.id, host: movedTo }, { timeoutMs: 60_000 });
+        const s = await deps.connect({ id: t.id, host: movedTo }, { timeoutMs: 60_000, requirePinned: true });
         saveState((st) => st.tvs[t.id] && (st.tvs[t.id] = defined({ ...st.tvs[t.id], host: movedTo, movedTo: undefined })));
         return s;
       } catch (e2) {

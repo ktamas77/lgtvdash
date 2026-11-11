@@ -32,7 +32,9 @@ export type Res = { uri: string; ok: boolean; payload: any };
 export type Target = { id: string; host: string };
 export type Found = { host: string; uuid?: string; name?: string; model?: string; mac?: string };
 // movedTo: an address discovery reported for this TV that hasn't passed the certificate check yet.
-export type TvRecord = Found & { cert?: string; key?: string; seenAt?: string; movedTo?: string };
+// locked: this TV has been paired at `host` at least once (kept through Re-pair), so discovery can no longer
+// change its address; only a connection presenting the pinned certificate can.
+export type TvRecord = Found & { cert?: string; key?: string; seenAt?: string; movedTo?: string; locked?: boolean };
 export type State = { version: 2; tvs: Record<string, TvRecord>; lastTv?: string };
 
 // A TV's id: its discovery uuid when known (survives IP changes), else its address.
@@ -63,10 +65,11 @@ export function migrateV1(raw: any): State {
   const tvs: Record<string, TvRecord> = {};
   for (const t of Object.values<any>(raw?.tvs ?? {})) {
     if (typeof t?.host !== "string") continue;
-    tvs[tvIdOf({ uuid: t.id, host: t.host })] = defined({ host: t.host, uuid: t.id, name: t.name, model: t.model, mac: t.mac, key: keys[t.host] });
+    const key = keys[t.host];
+    tvs[tvIdOf({ uuid: t.id, host: t.host })] = defined({ host: t.host, uuid: t.id, name: t.name, model: t.model, mac: t.mac, key, locked: key ? true : undefined });
   }
   for (const [host, key] of Object.entries(keys))
-    if (!Object.values(tvs).some((r) => r.host === host)) tvs[`host:${host}`] = { host, key };
+    if (!Object.values(tvs).some((r) => r.host === host)) tvs[`host:${host}`] = { host, key, locked: true };
   return { version: 2, tvs };
 }
 
@@ -196,9 +199,13 @@ export class Session {
 // Open a session. The pairing key is only sent after the TV proves it is the TV that issued it:
 // its certificate must match the pinned one; a key with no pinned certificate yet (paired before
 // pinning existed) is only sent to the address it was paired on.
-export function connect(target: Target, { timeoutMs = 90_000 } = {}): Promise<Session> {
+// requirePinned: for an unverified address (from discovery): fail closed unless a certificate is pinned,
+// so first-contact trust can never happen at an address discovery merely claimed.
+export function connect(target: Target, { timeoutMs = 90_000, requirePinned = false } = {}): Promise<Session> {
   return new Promise((resolve, reject) => {
     const rec = loadState().tvs[target.id];
+    if (requirePinned && !rec?.cert)
+      return reject(new CertChangedError(`no pinned certificate for ${target.id}: not trusting unverified address ${target.host}`));
     const conn = transport.open(`wss://${target.host}:3001`);
     let cert: string | undefined, done = false;
     const fail = (e: Error) => {
@@ -233,7 +240,7 @@ export function connect(target: Target, { timeoutMs = 90_000 } = {}): Promise<Se
       done = true;
       clearTimeout(timer);
       conn.off("message", onMessage);
-      saveState((s) => (s.tvs[target.id] = defined({ ...s.tvs[target.id], host: target.host, cert, key: k, movedTo: undefined })));
+      saveState((s) => (s.tvs[target.id] = defined({ ...s.tvs[target.id], host: target.host, cert, key: k, movedTo: undefined, locked: true })));
       resolve(new Session(target, conn));
     };
     conn.on("message", onMessage);
