@@ -317,7 +317,8 @@ export function registry({ deps = { connect, discover, wake } as Deps, config = 
     s?.then((x) => x.close(), () => {});
     certChanged.delete(t.id);
     saveState((st) => {
-      if (st.tvs[t.id]) st.tvs[t.id] = defined({ ...st.tvs[t.id], key: undefined, cert: undefined, movedTo: undefined });
+      // Lock first: the address must stay put even if this record predates the lock flag.
+      if (st.tvs[t.id]) st.tvs[t.id] = defined({ ...st.tvs[t.id], locked: true, key: undefined, cert: undefined, movedTo: undefined });
     });
   };
 

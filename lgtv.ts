@@ -49,7 +49,11 @@ export function loadState(): State {
   } catch {
     return { version: 2, tvs: {} };
   }
-  return raw?.version === 2 ? { version: 2, tvs: raw.tvs ?? {}, lastTv: raw.lastTv } : migrateV1(raw);
+  if (raw?.version !== 2) return migrateV1(raw);
+  // Records written before the lock flag existed: anything ever paired is locked to its address.
+  const tvs: Record<string, TvRecord> = raw.tvs ?? {};
+  for (const r of Object.values(tvs)) if ((r.key || r.cert) && !r.locked) r.locked = true;
+  return { version: 2, tvs, lastTv: raw.lastTv };
 }
 
 export function saveState(update: (s: State) => void) {

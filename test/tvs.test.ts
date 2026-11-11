@@ -108,8 +108,14 @@ test("SSDP spoof: a fake answer with the TV's uuid can't redirect it, and Re-pai
   assert.deepEqual(tv.connects.map((c) => c.host), ["10.0.0.5"]);
 });
 
+test("records saved before the lock flag existed are treated as locked; forget() locks too", () => {
+  seed({ "uuid-1": { ...TV1, cert: "AA", key: "k1" }, "uuid-2": { ...TV2 } });
+  assert.equal(loadState().tvs["uuid-1"].locked, true);
+  assert.equal(loadState().tvs["uuid-2"].locked, undefined); // never paired: not locked
+});
+
 test("SSDP spoof after Re-pair: no pinned certificate, so the spoofed address is never tried", async () => {
-  seed({ "uuid-1": { ...TV1, seenAt: "T", cert: "AA", key: "k1", locked: true } });
+  seed({ "uuid-1": { ...TV1, seenAt: "T", cert: "AA", key: "k1" } }); // pre-lock-flag record
   const r = makeRegistry();
   await r.forget(r.pick("uuid-1")); // user re-pairs: key and certificate gone, address stays locked
   tv.found = [{ ...TV1, host: "10.0.0.66" }]; // attacker answers with uuid-1
