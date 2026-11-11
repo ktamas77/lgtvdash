@@ -37,12 +37,14 @@ export const tv = {
   found: [] as any[],
   down: false,
   certChanged: false,
+  unreachable: new Set<string>(), // hosts that refuse connections
+  badCert: new Set<string>(), // hosts presenting a different certificate than the pinned one
   answer: (_uri: string, _payload?: object): { ok: boolean; payload: any } => ({ ok: true, payload: {} }),
   deps: {
     connect: async (target: { id: string; host: string }) => {
       tv.connects.push(target);
-      if (tv.down) throw new Error("connection failed: unreachable");
-      if (tv.certChanged) throw new CertChangedError(`certificate changed for ${target.id}`);
+      if (tv.down || tv.unreachable.has(target.host)) throw new Error("connection failed: unreachable");
+      if (tv.certChanged || tv.badCert.has(target.host)) throw new CertChangedError(`certificate changed for ${target.id}`);
       const s = new FakeSession(target);
       tv.sessions.push(s);
       return s;
@@ -52,6 +54,7 @@ export const tv = {
   },
   reset() {
     tv.calls = []; tv.connects = []; tv.sessions = []; tv.found = []; tv.down = false; tv.certChanged = false;
+    tv.unreachable = new Set(); tv.badCert = new Set();
     tv.answer = () => ({ ok: true, payload: {} });
     rmSync(process.env.LGTV_STATE!, { force: true });
     delete process.env.LGTV_BROADCAST;

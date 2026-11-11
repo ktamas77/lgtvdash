@@ -31,7 +31,8 @@ export type Req = [uri: string, payload?: object];
 export type Res = { uri: string; ok: boolean; payload: any };
 export type Target = { id: string; host: string };
 export type Found = { host: string; uuid?: string; name?: string; model?: string; mac?: string };
-export type TvRecord = Found & { cert?: string; key?: string; seenAt?: string };
+// movedTo: an address discovery reported for this TV that hasn't passed the certificate check yet.
+export type TvRecord = Found & { cert?: string; key?: string; seenAt?: string; movedTo?: string };
 export type State = { version: 2; tvs: Record<string, TvRecord>; lastTv?: string };
 
 // A TV's id: its discovery uuid when known (survives IP changes), else its address.
@@ -232,7 +233,7 @@ export function connect(target: Target, { timeoutMs = 90_000 } = {}): Promise<Se
       done = true;
       clearTimeout(timer);
       conn.off("message", onMessage);
-      saveState((s) => (s.tvs[target.id] = { ...s.tvs[target.id], host: target.host, cert, key: k }));
+      saveState((s) => (s.tvs[target.id] = defined({ ...s.tvs[target.id], host: target.host, cert, key: k, movedTo: undefined })));
       resolve(new Session(target, conn));
     };
     conn.on("message", onMessage);

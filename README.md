@@ -143,8 +143,10 @@ npm test         # node --test, no TV needed
   isn't verified; instead the certificate's SHA-256 fingerprint is pinned per TV on first contact, and the
   pairing key is only sent to a TV presenting that same certificate. A TV whose certificate changed
   (factory reset, possibly a firmware update) shows **Re-pair** instead of receiving the key.
-- Discovery answers (SSDP) are unauthenticated. A known TV's id showing up at a new IP keeps its key only
-  because the certificate check guards it; a TV paired before pinning existed must re-pair after an IP change.
+- Discovery answers (SSDP) are unauthenticated, so they never move a known TV by themselves. A pinned TV's
+  id showing up at a new IP is only recorded as a candidate; the TV's address changes once that IP presents
+  the pinned certificate. A spoofed answer fails that check and is dropped, and **Re-pair** always targets
+  the last verified address. A TV paired before pinning existed must re-pair after an IP change.
 - It only connects to TVs from `tvs.json` or discovery, never to a host named in a request, and only
   fetches a discovered TV's description URL when it points back at the IP that answered.
 - Pop-up messages use a plain OK button: no `onClick` service calls.

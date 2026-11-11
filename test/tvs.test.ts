@@ -25,14 +25,20 @@ test("absorbFound: a TV paired by address is folded into its uuid entry (key kep
   assert.equal(s.tvs["uuid-1"].key, "k1");
 });
 
-test("absorbFound: uuid at a new IP keeps its key only when the certificate is pinned", () => {
-  const pinned: any = { version: 2, tvs: { "uuid-1": { host: "10.0.0.5", key: "k1", cert: "AA" } } };
-  absorbFound(pinned, { ...TV1, host: "10.0.0.99" });
-  assert.deepEqual([pinned.tvs["uuid-1"].host, pinned.tvs["uuid-1"].key], ["10.0.0.99", "k1"]); // connect() checks the cert
+test("absorbFound: a pinned TV's uuid at a new IP is only a candidate; nothing else changes", () => {
+  const pinned: any = { version: 2, tvs: { "uuid-1": { host: "10.0.0.5", key: "k1", cert: "AA", mac: TV1.mac, name: "TV" } } };
+  absorbFound(pinned, { uuid: "uuid-1", host: "10.0.0.99", mac: "ee:ee:ee:ee:ee:ee", name: "Spoof" }, "T");
+  assert.deepEqual(pinned.tvs["uuid-1"], { host: "10.0.0.5", key: "k1", cert: "AA", mac: TV1.mac, name: "TV", seenAt: "T", movedTo: "10.0.0.99" });
 
+  absorbFound(pinned, TV1, "T2"); // seen at its real address again: candidate cleared
+  assert.equal(pinned.tvs["uuid-1"].movedTo, undefined);
+  assert.equal(pinned.tvs["uuid-1"].host, "10.0.0.5");
+});
+
+test("absorbFound: an unpinned TV at a new IP moves but loses its key (nothing to verify against)", () => {
   const unpinned: any = { version: 2, tvs: { "uuid-1": { host: "10.0.0.5", key: "k1" } } };
   absorbFound(unpinned, { ...TV1, host: "10.0.0.99" });
-  assert.equal(unpinned.tvs["uuid-1"].key, undefined); // can't verify the new IP: re-pair
+  assert.deepEqual([unpinned.tvs["uuid-1"].host, unpinned.tvs["uuid-1"].key], ["10.0.0.99", undefined]);
 });
 
 // --- list / merge ---
@@ -52,12 +58,43 @@ test("scan merges: config wins, discovery fills gaps, new TVs added, online flag
   ]);
 });
 
-test("a TV that moved IP keeps its id and key; a config entry with its uuid follows it", async () => {
+test("a TV that really moved: its new IP is used once it passes the certificate check", async () => {
   seed({ "uuid-1": { ...TV1, seenAt: "T", cert: "AA", key: "k1" } });
   tv.found = [{ ...TV1, host: "10.0.0.99" }];
-  const byUuid = makeRegistry([{ host: "10.0.0.5", uuid: "uuid-1", name: "Living room" }]);
-  await byUuid.scan();
-  assert.deepEqual(byUuid.list().map((t) => [t.id, t.host, t.paired]), [["uuid-1", "10.0.0.99", true]]);
+  const r = makeRegistry([{ host: "10.0.0.5", uuid: "uuid-1", name: "Living room" }]);
+  await r.scan();
+  assert.equal(r.pick("uuid-1").host, "10.0.0.5"); // not moved on discovery's word alone
+  tv.unreachable.add("10.0.0.5");
+  const s = await r.session(r.pick("uuid-1"));
+  assert.equal(s.target.host, "10.0.0.99");
+  assert.deepEqual(tv.connects.map((c) => c.host), ["10.0.0.5", "10.0.0.99"]);
+  assert.deepEqual([loadState().tvs["uuid-1"].host, loadState().tvs["uuid-1"].movedTo], ["10.0.0.99", undefined]);
+  assert.equal(r.pick("uuid-1").host, "10.0.0.99");
+});
+
+test("SSDP spoof: a fake answer with the TV's uuid can't redirect it, and Re-pair still goes to the real TV", async () => {
+  seed({ "uuid-1": { ...TV1, seenAt: "T", cert: "AA", key: "k1" } });
+  const r = makeRegistry();
+  tv.found = [{ ...TV1, host: "10.0.0.66", mac: "ee:ee:ee:ee:ee:ee" }]; // attacker at .66 claims uuid-1
+  await r.scan();
+  assert.deepEqual([r.pick("uuid-1").host, r.pick("uuid-1").mac], ["10.0.0.5", TV1.mac]);
+
+  // Real TV briefly unreachable: the candidate is tried, fails the certificate check, and is dropped.
+  tv.unreachable.add("10.0.0.5");
+  tv.badCert.add("10.0.0.66");
+  await assert.rejects(r.session(r.pick("uuid-1")), /unreachable/);
+  assert.equal(loadState().tvs["uuid-1"].movedTo, undefined);
+  assert.equal(loadState().tvs["uuid-1"].host, "10.0.0.5");
+
+  // Even if the user re-pairs while a spoofed candidate is recorded, re-pairing targets the verified address.
+  tv.found = [{ ...TV1, host: "10.0.0.66" }];
+  await r.scan();
+  await r.forget(r.pick("uuid-1"));
+  assert.deepEqual([loadState().tvs["uuid-1"].host, loadState().tvs["uuid-1"].movedTo], ["10.0.0.5", undefined]);
+  tv.unreachable.clear();
+  tv.connects = [];
+  await r.session(r.pick("uuid-1"));
+  assert.deepEqual(tv.connects.map((c) => c.host), ["10.0.0.5"]);
 });
 
 test("a discovered TV is remembered (offline) when a later scan misses it", async () => {

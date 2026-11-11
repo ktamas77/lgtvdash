@@ -69,9 +69,12 @@ export function loadConfig(path: string): ConfigTv[] {
   });
 }
 
-// Fold one discovery result into the state. A TV whose uuid shows up at a new IP keeps its key only
-// if its certificate is pinned (connect() then checks it); otherwise the key is dropped, because an
-// unverified device could be answering SSDP with someone else's uuid.
+// Fold one discovery result into the state. SSDP answers are unauthenticated, so a known TV's uuid
+// showing up at a new IP never moves it by itself:
+// - pinned certificate: the new IP is only recorded as `movedTo`; the TV's address (and everything else)
+//   changes only after that IP passes the certificate check (registry.session()). A spoofer can't, so it
+//   can't redirect the TV or a later re-pair.
+// - no pinned certificate: nothing to verify against, so the key is dropped and the TV must re-pair.
 export function absorbFound(s: State, f: Found, now = new Date().toISOString()) {
   const id = tvIdOf(f);
   let rec = s.tvs[id];
@@ -80,10 +83,13 @@ export function absorbFound(s: State, f: Found, now = new Date().toISOString()) 
     rec = s.tvs[byHost]; // paired before discovery knew its uuid: same address, same TV
     delete s.tvs[byHost];
   }
-  const moved = rec && rec.host !== f.host;
+  if (rec && rec.host !== f.host && rec.cert) {
+    s.tvs[id] = { ...rec, seenAt: now, movedTo: f.host };
+    return;
+  }
   s.tvs[id] = defined({
-    ...rec, ...defined(f), seenAt: now,
-    key: moved && !rec!.cert ? undefined : rec?.key,
+    ...rec, ...defined(f), seenAt: now, movedTo: undefined,
+    key: rec && rec.host !== f.host ? undefined : rec?.key,
   });
 }
 
@@ -206,6 +212,30 @@ export function registry({ deps = { connect, discover, wake } as Deps, config = 
     throw new Error(all.length ? `Several TVs: name one of ${all.map((t) => t.id).join(", ")}` : "No TVs known yet: scan with the TV on");
   };
 
+  // Connect at the TV's verified address. If that fails and discovery reported a new address (movedTo),
+  // try there: connect() only proceeds if the TV presents the pinned certificate, and then saves the new
+  // address. A different certificate there means a spoofer (or another TV): the candidate is dropped.
+  const connectVerified = async (t: ListedTv): Promise<Session> => {
+    try {
+      return await deps.connect({ id: t.id, host: t.host }, { timeoutMs: 60_000 });
+    } catch (e) {
+      const movedTo = loadState().tvs[t.id]?.movedTo;
+      if (!movedTo || e instanceof CertChangedError) throw e;
+      debug("trying address from discovery", t.id, movedTo);
+      try {
+        const s = await deps.connect({ id: t.id, host: movedTo }, { timeoutMs: 60_000 });
+        saveState((st) => st.tvs[t.id] && (st.tvs[t.id] = defined({ ...st.tvs[t.id], host: movedTo, movedTo: undefined })));
+        return s;
+      } catch (e2) {
+        if (e2 instanceof CertChangedError) {
+          debug("discovery address failed the certificate check; ignoring it", t.id, movedTo);
+          saveState((st) => st.tvs[t.id] && (st.tvs[t.id] = defined({ ...st.tvs[t.id], movedTo: undefined })));
+        }
+        throw e; // report the problem with the TV's real address
+      }
+    }
+  };
+
   // One shared session per TV; reconnects after the TV drops or changes IP.
   const session = (t: ListedTv): Promise<Session> => {
     const cached = sessions.get(t.id);
@@ -219,7 +249,7 @@ export function registry({ deps = { connect, discover, wake } as Deps, config = 
       }, () => session(t));
     }
     debug("session connect", t.id, t.host);
-    const p = deps.connect({ id: t.id, host: t.host }, { timeoutMs: 60_000 }).then(
+    const p = connectVerified(t).then(
       (s) => {
         certChanged.delete(t.id);
         s.onClose(() => sessions.get(t.id) === p && sessions.delete(t.id));
@@ -281,13 +311,14 @@ export function registry({ deps = { connect, discover, wake } as Deps, config = 
   };
 
   // Re-pair: drop the key and pinned certificate; the next connection shows a new prompt on the TV.
+  // It goes to the last verified address only: an unverified discovery address is dropped too.
   const forget = async (t: ListedTv) => {
     const s = sessions.get(t.id);
     sessions.delete(t.id);
     s?.then((x) => x.close(), () => {});
     certChanged.delete(t.id);
     saveState((st) => {
-      if (st.tvs[t.id]) st.tvs[t.id] = defined({ ...st.tvs[t.id], key: undefined, cert: undefined });
+      if (st.tvs[t.id]) st.tvs[t.id] = defined({ ...st.tvs[t.id], key: undefined, cert: undefined, movedTo: undefined });
     });
   };
 
