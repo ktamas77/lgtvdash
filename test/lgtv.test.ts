@@ -1,124 +1,217 @@
-// Client tests against a fake TV: globalThis.WebSocket is swapped for a scripted stand-in.
+// Client tests against a fake TV: lgtv.ts's transport is swapped for a scripted stand-in
+// that presents a chosen TLS certificate fingerprint.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DIR = mkdtempSync(join(tmpdir(), "lgtv-"));
 process.env.LGTV_STATE = join(DIR, "state.json");
 const STATE = process.env.LGTV_STATE;
-const LEGACY = join(DIR, ".lgtv-key");
+const lgtv = await import("../lgtv.ts");
+const { connect, ask, magicPacket, parseSsdp, absorb, loadState, migrateV1, transport, CertChangedError } = lgtv;
 
 type Msg = Record<string, any>;
-class FakeTV {
-  static script: (m: Msg) => Msg[] = () => [];
-  static sockets: FakeTV[] = [];
+class FakeConn extends EventEmitter {
+  static script: (m: Msg, c: FakeConn) => Msg[] = () => [];
+  static cert: string | undefined = "AA:AA";
+  static conns: FakeConn[] = [];
   sent: any[] = [];
+  closed = false;
   url: string;
-  onopen?: () => void; onmessage?: (e: { data: string }) => void; onerror?: (e: any) => void; onclose?: () => void;
   constructor(url: string) {
+    super();
     this.url = url;
-    FakeTV.sockets.push(this);
-    setImmediate(() => this.onopen?.());
+    FakeConn.conns.push(this);
+    const cert = FakeConn.cert;
+    setImmediate(() => this.emit("open", cert));
   }
   send(s: string) {
     let m: Msg;
-    try { m = JSON.parse(s); } catch { return void this.sent.push(s); } // pointer socket frames are plain text
+    try { m = JSON.parse(s); } catch { return void this.sent.push(s); } // pointer frames are plain text
     this.sent.push(m);
-    for (const r of FakeTV.script(m)) setImmediate(() => this.onmessage?.({ data: typeof r === "string" ? r : JSON.stringify(r) }));
+    for (const r of FakeConn.script(m, this)) this.reply(r);
   }
-  close() {}
+  reply(r: Msg | string) { setImmediate(() => this.emit("message", typeof r === "string" ? r : JSON.stringify(r))); }
+  close() { this.closed = true; setImmediate(() => this.emit("close")); }
 }
-(globalThis as any).WebSocket = FakeTV;
-const { ask, button, magicPacket, parseSsdp, absorb, loadState } = await import("../lgtv.ts");
+transport.open = (url: string) => new FakeConn(url) as any;
 
+const T1 = { id: "uuid-1", host: "10.0.0.5" };
 const registered = (key = "k1"): Msg => ({ id: "reg", type: "registered", payload: { "client-key": key } });
 const ok = (m: Msg, payload: Msg = {}): Msg => ({ id: m.id, type: "response", payload: { returnValue: true, ...payload } });
-const sentKey = (i = 0) => FakeTV.sockets[i].sent[0].payload["client-key"];
+const echo = (key = "k1") => (m: Msg) => (m.type === "register" ? [registered(m.payload["client-key"] ?? key)] : m.type === "request" ? [ok(m, { uri: m.uri })] : []);
+const registerOf = (i = 0) => FakeConn.conns[i].sent.find((m) => m.type === "register");
+const seed = (tvs: object) => writeFileSync(STATE, JSON.stringify({ version: 2, tvs }));
 
 beforeEach(() => {
-  FakeTV.sockets = [];
+  FakeConn.conns = [];
+  FakeConn.cert = "AA:AA";
+  FakeConn.script = echo();
   rmSync(STATE, { force: true });
-  rmSync(LEGACY, { force: true });
 });
 
-test("pairs, saves the key for that host, and returns answers in request order", async () => {
-  FakeTV.script = (m) => {
-    if (m.type === "register") return [{ id: "reg", type: "response", payload: { pairingType: "PROMPT" } }, registered("k1")];
-    return [ok(m, { uri: m.uri })];
-  };
-  const res = await ask("tv1.test", [["ssap://a"], ["ssap://b", { x: 1 }]], 1000);
-  assert.deepEqual(res.map((r) => [r.uri, r.ok, r.payload.uri]), [["ssap://a", true, "ssap://a"], ["ssap://b", true, "ssap://b"]]);
-  assert.equal(FakeTV.sockets[0].url, "ws://tv1.test:3000");
-  assert.equal(sentKey(), undefined);
-  assert.deepEqual(FakeTV.sockets[0].sent[2].payload, { x: 1 });
-  assert.deepEqual(loadState().keys, { "tv1.test": "k1" });
+// --- pairing, certificate pinning ---
+
+test("first contact: pairs over wss, pins the certificate, saves the key", async () => {
+  FakeConn.script = (m) => (m.type === "register" ? [{ id: "reg", type: "response", payload: { pairingType: "PROMPT" } }, registered("k1")] : []);
+  const s = await connect(T1, { timeoutMs: 1000 });
+  assert.equal(FakeConn.conns[0].url, "wss://10.0.0.5:3001");
+  assert.equal(registerOf().payload["client-key"], undefined);
+  assert.deepEqual(loadState().tvs["uuid-1"], { host: "10.0.0.5", cert: "AA:AA", key: "k1" });
+  s.close();
 });
 
-test("keeps one key per TV and sends each TV its own", async () => {
-  writeFileSync(STATE, JSON.stringify({ keys: { "tv1.test": "key-1" } }));
-  FakeTV.script = (m) => (m.type === "register" ? [registered(m.payload["client-key"] ?? "key-2")] : [ok(m)]);
-  await ask("tv1.test", [["ssap://a"]], 1000);
-  await ask("tv2.test", [["ssap://a"]], 1000);
-  assert.equal(sentKey(0), "key-1");
-  assert.equal(sentKey(1), undefined); // never offers TV 1's key to TV 2
-  assert.deepEqual(loadState().keys, { "tv1.test": "key-1", "tv2.test": "key-2" });
+test("matching certificate: the saved key is sent", async () => {
+  seed({ "uuid-1": { host: "10.0.0.5", cert: "AA:AA", key: "k1" } });
+  (await connect(T1, { timeoutMs: 1000 })).close();
+  assert.equal(registerOf().payload["client-key"], "k1");
 });
 
-test("never sends a key to a host it wasn't issued by (a spoofed SSDP answer gets nothing)", async () => {
-  writeFileSync(LEGACY, "old-single-tv-key\n"); // pre-multi-TV key file is ignored, never migrated
-  writeFileSync(STATE, JSON.stringify({ keys: { "tv1.test": "key-1" } }));
-  FakeTV.script = (m) => (m.type === "register" ? [registered("fresh")] : [ok(m)]);
-  await ask("spoof.test", [["ssap://a"]], 1000);
-  assert.equal(sentKey(0), undefined);
+test("changed certificate: the key is never sent and the error says so", async () => {
+  seed({ "uuid-1": { host: "10.0.0.5", cert: "AA:AA", key: "k1" } });
+  FakeConn.cert = "BB:BB";
+  await assert.rejects(connect(T1, { timeoutMs: 1000 }), (e: any) => e instanceof CertChangedError && /certificate changed/.test(e.message));
+  assert.equal(registerOf(), undefined);
+  assert.ok(FakeConn.conns[0].closed);
 });
 
-test("maps TV errors and returnValue:false to ok:false", async () => {
-  FakeTV.script = (m) => {
+test("same TV at a new IP with the same certificate: gets its key", async () => {
+  seed({ "uuid-1": { host: "10.0.0.5", cert: "AA:AA", key: "k1" } });
+  (await connect({ id: "uuid-1", host: "10.0.0.99" }, { timeoutMs: 1000 })).close();
+  assert.equal(registerOf().payload["client-key"], "k1");
+  assert.equal(loadState().tvs["uuid-1"].host, "10.0.0.99");
+});
+
+test("key without a pinned certificate (migrated) is only sent to the IP it was paired on", async () => {
+  seed({ "uuid-1": { host: "10.0.0.5", key: "k1" } });
+  (await connect({ id: "uuid-1", host: "10.0.0.99" }, { timeoutMs: 1000 })).close();
+  assert.equal(registerOf(0).payload["client-key"], undefined);
+  seed({ "uuid-1": { host: "10.0.0.5", key: "k1" } });
+  (await connect(T1, { timeoutMs: 1000 })).close();
+  assert.equal(registerOf(1).payload["client-key"], "k1");
+  assert.equal(loadState().tvs["uuid-1"].cert, "AA:AA"); // pinned from now on
+});
+
+test("no certificate at all is refused", async () => {
+  FakeConn.cert = undefined;
+  await assert.rejects(connect(T1, { timeoutMs: 1000 }), /no TLS certificate/);
+  assert.equal(registerOf(), undefined);
+});
+
+test("refused pairing, missing key, garbage, and silence all reject", async () => {
+  FakeConn.script = () => [{ id: "reg", type: "error", error: "403 cancelled" }];
+  await assert.rejects(connect(T1, { timeoutMs: 1000 }), /refused pairing: 403 cancelled/);
+  FakeConn.script = () => [{ id: "reg", type: "registered", payload: {} }];
+  await assert.rejects(connect(T1, { timeoutMs: 1000 }), /no client key/);
+  assert.deepEqual(loadState().tvs, {});
+  FakeConn.script = () => ["{not json" as any];
+  await assert.rejects(connect(T1, { timeoutMs: 1000 }), /unreadable/);
+  FakeConn.script = () => [];
+  await assert.rejects(connect(T1, { timeoutMs: 50 }), /timeout/);
+});
+
+// --- session ---
+
+test("requests: answers matched by id, errors and returnValue:false are ok:false", async () => {
+  FakeConn.script = (m) => {
     if (m.type === "register") return [registered()];
     if (m.uri === "ssap://denied") return [{ id: m.id, type: "error", error: "401 insufficient permissions" }];
-    return [{ id: m.id, type: "response", payload: { returnValue: false, errorText: "nope" } }];
+    if (m.uri === "ssap://failed") return [{ id: m.id, type: "response", payload: { returnValue: false } }];
+    return [ok(m, { uri: m.uri })];
   };
-  const [denied, failed] = await ask("tv.test", [["ssap://denied"], ["ssap://failed"]], 1000);
+  const s = await connect(T1, { timeoutMs: 1000 });
+  const [a, denied, failed] = await Promise.all([s.request("ssap://a"), s.request("ssap://denied"), s.request("ssap://failed")]);
+  assert.deepEqual([a.ok, a.payload.uri], [true, "ssap://a"]);
   assert.deepEqual([denied.ok, denied.payload], [false, "401 insufficient permissions"]);
   assert.equal(failed.ok, false);
+  s.close();
 });
 
-test("rejects when the TV refuses pairing", async () => {
-  FakeTV.script = () => [{ id: "reg", type: "error", error: "403 cancelled" }];
-  await assert.rejects(ask("tv.test", [["ssap://a"]], 1000), /refused pairing: 403 cancelled/);
+test("an unanswered request times out; requests after close fail fast", async () => {
+  FakeConn.script = (m) => (m.type === "register" ? [registered()] : []);
+  const s = await connect(T1, { timeoutMs: 1000 });
+  assert.deepEqual(await s.request("ssap://slow", {}, 30), { uri: "ssap://slow", ok: false, payload: "timeout: no answer from the TV" });
+  s.close();
+  assert.equal((await s.request("ssap://a")).payload, "connection closed");
 });
 
-test("rejects a registration without a client key, and saves nothing", async () => {
-  FakeTV.script = () => [{ id: "reg", type: "registered", payload: {} }];
-  await assert.rejects(ask("tv.test", [["ssap://a"]], 1000), /no client key/);
-  assert.deepEqual(loadState().keys, {});
+test("pending requests fail and onClose fires when the TV drops", async () => {
+  FakeConn.script = (m) => (m.type === "register" ? [registered()] : []);
+  const s = await connect(T1, { timeoutMs: 1000 });
+  let closed = 0;
+  s.onClose(() => closed++);
+  const pending = s.request("ssap://a");
+  FakeConn.conns[0].emit("close");
+  assert.equal((await pending).payload, "connection closed");
+  assert.equal(closed, 1);
+  assert.ok(s.closed);
 });
 
-test("rejects on malformed JSON from the TV", async () => {
-  FakeTV.script = () => ["{not json" as any];
-  await assert.rejects(ask("tv.test", [["ssap://a"]], 1000));
+test("subscriptions deliver every push until unsubscribed", async () => {
+  const s = await connect(T1, { timeoutMs: 1000 });
+  const got: any[] = [];
+  const off = s.subscribe("ssap://audio/getVolume", (r) => got.push(r.payload.volume));
+  const conn = FakeConn.conns[0];
+  const sub = conn.sent.find((m) => m.type === "subscribe");
+  assert.equal(sub.uri, "ssap://audio/getVolume");
+  conn.reply(ok(sub, { volume: 10 }));
+  conn.reply(ok(sub, { volume: 11 }));
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  off();
+  conn.reply(ok(sub, { volume: 12 }));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(got, [10, 11]);
+  assert.deepEqual(conn.sent.at(-1), { type: "unsubscribe", id: sub.id });
+  s.close();
 });
 
-test("unanswered requests come back as ok:false after the timeout", async () => {
-  FakeTV.script = (m) => (m.type === "register" ? [registered()] : m.uri === "ssap://slow" ? [] : [ok(m)]);
-  const [fast, slow] = await ask("tv.test", [["ssap://fast"], ["ssap://slow"]], 100);
-  assert.equal(fast.ok, true);
-  assert.deepEqual([slow.ok, slow.payload], [false, "timeout: no answer from the TV"]);
+test("pointer frames go over one lazily opened pointer socket", async () => {
+  FakeConn.script = (m) => (m.type === "register" ? [registered()] : [ok(m, { socketPath: "ws://10.0.0.5:3000/pointer" })]);
+  const s = await connect(T1, { timeoutMs: 1000 });
+  await s.pointer("type:button\nname:UP\n\n");
+  await s.pointer("type:click\n\n");
+  const pointers = FakeConn.conns.filter((c) => c.url === "ws://10.0.0.5:3000/pointer");
+  assert.equal(pointers.length, 1);
+  assert.deepEqual(pointers[0].sent, ["type:button\nname:UP\n\n", "type:click\n\n"]);
+  s.close();
 });
 
-test("rejects with a timeout when the TV never registers", async () => {
-  FakeTV.script = () => [];
-  await assert.rejects(ask("tv.test", [["ssap://a"]], 50), /timeout/);
+test("ask(): connect, batch, close", async () => {
+  const res = await ask(T1, [["ssap://a"], ["ssap://b", { x: 1 }]], 1000);
+  assert.deepEqual(res.map((r) => r.payload.uri), ["ssap://a", "ssap://b"]);
+  assert.deepEqual(FakeConn.conns[0].sent[2].payload, { x: 1 });
+  assert.ok(FakeConn.conns[0].closed);
 });
 
-test("button() presses through the pointer socket", async () => {
-  FakeTV.script = (m) => (m.type === "register" ? [registered()] : [ok(m, { socketPath: "ws://tv.test:3000/pointer" })]);
-  await button("tv.test", "UP");
-  const pointer = FakeTV.sockets.find((s) => s.url === "ws://tv.test:3000/pointer");
-  assert.deepEqual(pointer?.sent, ["type:button\nname:UP\n\n"]);
+// --- state ---
+
+test("v1 state migrates: keys move onto their TV, entries re-keyed by uuid", () => {
+  const s = migrateV1({
+    keys: { "10.0.0.5": "k1", "10.0.0.7": "k7" },
+    tvs: { "10.0.0.5": { host: "10.0.0.5", id: "uuid-1", name: "TV", mac: "aa:aa:aa:aa:aa:aa" }, "10.0.0.6": { host: "10.0.0.6" } },
+  });
+  assert.deepEqual(s, {
+    version: 2,
+    tvs: {
+      "uuid-1": { host: "10.0.0.5", uuid: "uuid-1", name: "TV", mac: "aa:aa:aa:aa:aa:aa", key: "k1" },
+      "host:10.0.0.6": { host: "10.0.0.6" },
+      "host:10.0.0.7": { host: "10.0.0.7", key: "k7" },
+    },
+  });
+  writeFileSync(STATE, JSON.stringify({ keys: { "10.0.0.5": "k1" }, tvs: { "10.0.0.5": { host: "10.0.0.5", id: "uuid-1" } } }));
+  assert.equal(loadState().tvs["uuid-1"].key, "k1");
 });
+
+test("unreadable state is treated as empty", () => {
+  writeFileSync(STATE, "not json");
+  assert.deepEqual(loadState(), { version: 2, tvs: {} });
+});
+
+// --- Wake-on-LAN, discovery parsing ---
 
 test("magicPacket: 6x FF then the MAC 16 times, any separator", () => {
   const p = magicPacket("0A-1b:2c.3D:4e:5f");
@@ -129,45 +222,31 @@ test("magicPacket: 6x FF then the MAC 16 times, any separator", () => {
   assert.throws(() => magicPacket("zz:zz:zz:zz:zz:zz"), /MAC/);
 });
 
-// --- discovery parsing (shapes copied from a real webOS 4.x TV, values neutralised) ---
+// Shapes copied from a real webOS 4.x TV, values neutralised.
 const secondScreen = [
   "HTTP/1.1 200 OK", "Location: http://10.0.0.5:1673/", "Cache-Control: max-age=1800", "Server: WebOS/4.1.0 UPnP/1.0", "EXT: ",
   "USN: uuid:11111111-2222-3333-4444-555555555555::urn:lge-com:service:webos-second-screen:1",
   "ST: urn:lge-com:service:webos-second-screen:1", "",
 ].join("\r\n");
 const dial = [
-  "HTTP/1.1 200 OK", "Location: http://10.0.0.5:1444/", "Server: WebOS/1.5 UPnP/1.0 webOSTV/1.0",
-  "USN: uuid:aaaa::urn:dial-multiscreen-org:service:dial:1", "ST: urn:dial-multiscreen-org:service:dial:1",
-  "WAKEUP: MAC=0A:1B:2C:3D:4E:5F;Timeout=60", "",
+  "HTTP/1.1 200 OK", "Location: http://10.0.0.5:1444/", "USN: uuid:aaaa::urn:dial-multiscreen-org:service:dial:1",
+  "ST: urn:dial-multiscreen-org:service:dial:1", "WAKEUP: MAC=0A:1B:2C:3D:4E:5F;Timeout=60", "",
 ].join("\r\n");
-const sonos = ["HTTP/1.1 200 OK", "ST: upnp:rootdevice", "SERVER: Linux UPnP/1.0 Sonos/86", "USN: uuid:RINCON::upnp:rootdevice", ""].join("\r\n");
+const sonos = ["HTTP/1.1 200 OK", "ST: upnp:rootdevice", "USN: uuid:RINCON::upnp:rootdevice", ""].join("\r\n");
 
 test("parseSsdp: lowercases header names, keeps values (including colons)", () => {
   const h = parseSsdp(secondScreen);
   assert.equal(h.location, "http://10.0.0.5:1673/");
-  assert.equal(h.st, "urn:lge-com:service:webos-second-screen:1");
   assert.equal(h.ext, "");
 });
 
-test("absorb: a webOS answer creates a TV; DIAL adds its MAC; other devices are ignored", () => {
+test("absorb: webOS answer creates a TV with its uuid; DIAL adds the MAC; others ignored", () => {
   const found = new Map(), macs = new Map();
-  absorb(found, macs, "10.0.0.5", dial); // MAC can arrive before the webOS answer
+  absorb(found, macs, "10.0.0.5", dial);
   absorb(found, macs, "10.0.0.5", secondScreen);
-  absorb(found, macs, "10.0.0.5", secondScreen); // duplicate answers are harmless
+  absorb(found, macs, "10.0.0.5", secondScreen);
   absorb(found, macs, "10.0.0.9", sonos);
-  assert.deepEqual([...found.values()], [{ host: "10.0.0.5", id: "11111111-2222-3333-4444-555555555555", location: "http://10.0.0.5:1673/" }]);
+  absorb(found, macs, "10.0.0.7", dial.replace(/WAKEUP.*\r\n/, "")); // DIAL-only device (e.g. Chromecast)
+  assert.deepEqual([...found.values()], [{ host: "10.0.0.5", uuid: "11111111-2222-3333-4444-555555555555", location: "http://10.0.0.5:1673/" }]);
   assert.deepEqual([...macs], [["10.0.0.5", "0a:1b:2c:3d:4e:5f"]]);
-});
-
-test("absorb: a DIAL-only device (e.g. a Chromecast) is not a TV", () => {
-  const found = new Map(), macs = new Map();
-  absorb(found, macs, "10.0.0.7", dial.replace("WAKEUP: MAC=0A:1B:2C:3D:4E:5F;Timeout=60", ""));
-  assert.equal(found.size, 0);
-});
-
-test("state file is the temp one (tests never touch the real keys)", () => {
-  writeFileSync(STATE, "not json");
-  assert.deepEqual(loadState(), { keys: {}, tvs: {} });
-  assert.ok(STATE.startsWith(DIR));
-  assert.equal(readFileSync(STATE, "utf8"), "not json");
 });

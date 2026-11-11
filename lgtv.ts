@@ -1,14 +1,20 @@
 #!/usr/bin/env node
-// Client for LG webOS TVs: SSAP websocket API, SSDP discovery, Wake-on-LAN. Library + CLI.
+// Client for LG webOS TVs: SSAP over wss with per-TV certificate pinning, SSDP discovery, Wake-on-LAN.
 //   node lgtv.ts --discover                          -> list TVs on the network
 //   node lgtv.ts                                     -> system info of the first TV found (pairs on first run)
 //   LGTV_HOST=<ip> node lgtv.ts ssap://audio/setVolume '{"volume":10}'
-// Pairing pops a prompt on the TV; granted keys are kept per TV in .lgtv-state.json.
+// Pairing pops a prompt on the TV; keys and pinned certificates are kept per TV in .lgtv-state.json.
+import WebSocket from "ws";
+import { EventEmitter } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
+import type { TLSSocket } from "node:tls";
 import { fileURLToPath } from "node:url";
 
 const STATE = process.env.LGTV_STATE ?? fileURLToPath(new URL(".lgtv-state.json", import.meta.url));
+
+// LGTV_DEBUG=1: connection lifecycle to stderr (stdout stays clean for the MCP protocol).
+export const debug = (...a: unknown[]) => process.env.LGTV_DEBUG && console.error(new Date().toISOString(), "[lgtv]", ...a);
 
 // Asked for up front: adding a permission later means a new prompt on the TV.
 const permissions = [
@@ -23,94 +29,227 @@ const permissions = [
 
 export type Req = [uri: string, payload?: object];
 export type Res = { uri: string; ok: boolean; payload: any };
-export type Tv = { host: string; name?: string; model?: string; mac?: string; id?: string };
-export type State = { keys: Record<string, string>; tvs: Record<string, Tv> };
+export type Target = { id: string; host: string };
+export type Found = { host: string; uuid?: string; name?: string; model?: string; mac?: string };
+export type TvRecord = Found & { cert?: string; key?: string; seenAt?: string };
+export type State = { version: 2; tvs: Record<string, TvRecord>; lastTv?: string };
 
-// Client keys and every TV seen so far (so a TV that is off can still be woken after a restart).
+// A TV's id: its discovery uuid when known (survives IP changes), else its address.
+export const tvIdOf = (t: { uuid?: string; host: string }) => t.uuid ?? `host:${t.host}`;
+export const defined = <T extends object>(o: T) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+
+// --- State: per-TV pairing key, pinned certificate, and what discovery saw ---
 export function loadState(): State {
+  let raw: any;
   try {
-    const s = JSON.parse(readFileSync(STATE, "utf8"));
-    return { keys: s.keys ?? {}, tvs: s.tvs ?? {} };
+    raw = JSON.parse(readFileSync(STATE, "utf8"));
   } catch {
-    return { keys: {}, tvs: {} };
+    return { version: 2, tvs: {} };
   }
+  return raw?.version === 2 ? { version: 2, tvs: raw.tvs ?? {}, lastTv: raw.lastTv } : migrateV1(raw);
 }
+
 export function saveState(update: (s: State) => void) {
   const s = loadState();
   update(s);
   writeFileSync(STATE, JSON.stringify(s, null, 2) + "\n", { mode: 0o600 });
 }
 
-// ponytail: keys are per IP, so a TV that changes IP asks to pair again. Key by discovery id if that bites.
-// A key is only ever sent to the host it was issued by (discovery answers are unauthenticated).
-const keyFor = (host: string): string | undefined => loadState().keys[host];
+// v1 kept keys by IP ({ keys: {ip: key}, tvs: {ip: {id: uuid, ...}} }). Keys stay tied to the IP they were
+// paired on until the first wss connection pins that TV's certificate.
+export function migrateV1(raw: any): State {
+  const keys: Record<string, string> = raw?.keys ?? {};
+  const tvs: Record<string, TvRecord> = {};
+  for (const t of Object.values<any>(raw?.tvs ?? {})) {
+    if (typeof t?.host !== "string") continue;
+    tvs[tvIdOf({ uuid: t.id, host: t.host })] = defined({ host: t.host, uuid: t.id, name: t.name, model: t.model, mac: t.mac, key: keys[t.host] });
+  }
+  for (const [host, key] of Object.entries(keys))
+    if (!Object.values(tvs).some((r) => r.host === host)) tvs[`host:${host}`] = { host, key };
+  return { version: 2, tvs };
+}
 
-// One connection: register, send every request, resolve once all have answered.
-// Fails only if it never gets registered; after that, unanswered requests come back as ok:false.
-// ponytail: connection per call, no subscriptions. Hold the socket open if you need live events.
-export function ask(host: string, reqs: Req[], timeoutMs = 90_000): Promise<Res[]> {
-  return new Promise((resolve, reject) => {
-    const key = keyFor(host);
-    const out: Res[] = [];
-    let left = reqs.length, registered = false, settled = false;
-    const ws = new WebSocket(`ws://${host}:3000`);
-    const send = (o: object) => ws.send(JSON.stringify(o));
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      ws.close();
-      if (err && !registered) return reject(err);
-      reqs.forEach(([uri], i) => (out[i] ??= { uri, ok: false, payload: err?.message ?? "no answer" }));
-      resolve(out);
-    };
-    const timer = setTimeout(() => finish(new Error("timeout: no answer from the TV")), timeoutMs);
+// --- Transport ---
+export interface Conn extends EventEmitter {
+  send(text: string): void;
+  close(): void;
+}
 
-    ws.onerror = (e: any) => finish(new Error(`websocket error: ${e.message || "connection failed"}`));
-    ws.onclose = () => finish(new Error("connection closed by the TV"));
-    ws.onopen = () => send({
-      type: "register", id: "reg",
-      payload: { forcePairing: false, pairingType: "PROMPT", "client-key": key, manifest: { manifestVersion: 1, permissions } },
+// Emits "open" (with the TLS certificate's SHA-256 fingerprint), "message" (text), "close", "error".
+export const transport = {
+  open(url: string): Conn {
+    // Chain verification is off on purpose: every webOS TV has its own self-signed certificate.
+    // Trust comes from pinning that certificate's fingerprint per TV instead (see connect()).
+    const ws = new WebSocket(url, { rejectUnauthorized: false, handshakeTimeout: 8000 });
+    const conn = Object.assign(new EventEmitter(), {
+      send: (t: string) => ws.send(t),
+      close: () => ws.terminate(),
     });
-    ws.onmessage = ({ data }) => { try { onMessage(JSON.parse(data)); } catch (e: any) { finish(e); } };
-    const onMessage = (m: any) => {
-      if (m.type === "registered") {
-        const k = m.payload?.["client-key"];
-        if (typeof k !== "string" || !k) return finish(new Error("TV sent no client key"));
-        registered = true;
-        if (k !== loadState().keys[host]) saveState((s) => (s.keys[host] = k));
-        if (!left) return finish();
-        return reqs.forEach(([uri, payload = {}], i) => send({ type: "request", id: String(i), uri, payload }));
-      }
-      if (m.id === "reg") {
-        if (m.type === "error") return finish(new Error(`TV refused pairing: ${m.error}`));
-        return console.error(`Waiting: accept the pairing prompt on the TV at ${host}...`);
-      }
-      const i = Number(m.id);
-      if (!reqs[i] || out[i]) return;
-      const failed = m.type === "error" || m.payload?.returnValue === false;
-      out[i] = { uri: reqs[i][0], ok: !failed, payload: m.type === "error" ? m.error : m.payload };
-      if (--left === 0) finish();
+    let cert: string | undefined;
+    ws.on("upgrade", (res) => (cert = (res.socket as TLSSocket).getPeerCertificate?.()?.fingerprint256));
+    const path = url.replace(/\/resources\/.*/, "/resources/…");
+    debug("open", path);
+    ws.on("open", () => conn.emit("open", cert));
+    ws.on("message", (d) => conn.emit("message", String(d)));
+    ws.on("close", (code, reason) => (debug("closed", path, code, String(reason)), conn.emit("close")));
+    ws.on("error", (e) => (debug("error", path, e.message), conn.emit("error", e)));
+    return conn;
+  },
+};
+
+export class CertChangedError extends Error {}
+
+const toRes = (uri: string, m: any): Res => ({
+  uri,
+  ok: m.type !== "error" && m.payload?.returnValue !== false,
+  payload: m.type === "error" ? m.error : m.payload,
+});
+
+// A registered connection to one TV: requests, subscriptions, and the pointer socket (buttons, mouse).
+export class Session {
+  target: Target;
+  closed = false;
+  #conn: Conn;
+  #n = 0;
+  #pending = new Map<string, (m: any) => void>();
+  #subs = new Map<string, (r: Res) => void>();
+  #onClose = new Set<() => void>();
+  #pointer?: Promise<Conn>;
+
+  constructor(target: Target, conn: Conn) {
+    this.target = target;
+    this.#conn = conn;
+    conn.on("message", (text: string) => {
+      let m: any;
+      try { m = JSON.parse(text); } catch { return; }
+      this.#pending.get(m.id)?.(m) ?? this.#subs.get(m.id)?.(m);
+    });
+    conn.on("close", () => this.#shutdown());
+    conn.on("error", () => this.#shutdown());
+  }
+
+  request(uri: string, payload: object = {}, timeoutMs = 10_000): Promise<Res> {
+    if (this.closed) return Promise.resolve({ uri, ok: false, payload: "connection closed" });
+    const id = `r${++this.#n}`;
+    return new Promise((resolve) => {
+      const done = (r: Res) => (clearTimeout(timer), this.#pending.delete(id), resolve(r));
+      const timer = setTimeout(() => done({ uri, ok: false, payload: "timeout: no answer from the TV" }), timeoutMs);
+      this.#pending.set(id, (m) => done(m.type === "closed" ? { uri, ok: false, payload: "connection closed" } : toRes(uri, m)));
+      this.#conn.send(JSON.stringify({ type: "request", id, uri, payload }));
+    });
+  }
+
+  // The TV answers once with the current value, then again on every change. Returns an unsubscribe function.
+  subscribe(uri: string, cb: (r: Res) => void): () => void {
+    const id = `s${++this.#n}`;
+    this.#subs.set(id, (m) => cb(toRes(uri, m)));
+    this.#conn.send(JSON.stringify({ type: "subscribe", id, uri, payload: {} }));
+    return () => {
+      if (this.#subs.delete(id) && !this.closed) this.#conn.send(JSON.stringify({ type: "unsubscribe", id }));
     };
+  }
+
+  onClose(cb: () => void) {
+    if (this.closed) cb();
+    else this.#onClose.add(cb);
+  }
+
+  // Raw pointer-socket frame: "type:button\nname:UP\n\n", "type:move\ndx:5\ndy:0\ndown:0\n\n", "type:click\n\n".
+  async pointer(frame: string) {
+    this.#pointer ??= this.#openPointer().catch((e) => {
+      this.#pointer = undefined;
+      throw e;
+    });
+    (await this.#pointer).send(frame);
+  }
+
+  async #openPointer(): Promise<Conn> {
+    const r = await this.request("ssap://com.webos.service.networkinput/getPointerInputSocket");
+    if (!r.ok) throw new Error(`pointer socket: ${r.payload}`);
+    const c = transport.open(r.payload.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      c.once("open", () => resolve());
+      c.once("error", () => reject(new Error("pointer socket connection failed")));
+    });
+    c.on("close", () => (this.#pointer = undefined));
+    c.on("error", () => (this.#pointer = undefined));
+    return c;
+  }
+
+  close() {
+    if (!this.closed) debug("session close() by us", this.target.host, new Error().stack?.split("\n")[2]?.trim());
+    this.#conn.close();
+    this.#shutdown();
+  }
+
+  #shutdown() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const h of [...this.#pending.values()]) h({ type: "closed" });
+    this.#subs.clear();
+    this.#pointer?.then((c) => c.close(), () => {});
+    for (const cb of this.#onClose) cb();
+  }
+}
+
+// Open a session. The pairing key is only sent after the TV proves it is the TV that issued it:
+// its certificate must match the pinned one; a key with no pinned certificate yet (paired before
+// pinning existed) is only sent to the address it was paired on.
+export function connect(target: Target, { timeoutMs = 90_000 } = {}): Promise<Session> {
+  return new Promise((resolve, reject) => {
+    const rec = loadState().tvs[target.id];
+    const conn = transport.open(`wss://${target.host}:3001`);
+    let cert: string | undefined, done = false;
+    const fail = (e: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      conn.close();
+      reject(e);
+    };
+    const timer = setTimeout(() => fail(new Error("timeout: no answer from the TV")), timeoutMs);
+    conn.on("error", (e: Error) => fail(new Error(`connection failed: ${e.message || "unreachable"}`)));
+    conn.on("close", () => fail(new Error("connection closed by the TV")));
+    conn.on("open", (fp?: string) => {
+      if (!fp) return fail(new Error("TV presented no TLS certificate"));
+      if (rec?.cert && rec.cert !== fp)
+        return fail(new CertChangedError(`certificate changed for ${target.id} at ${target.host}: pairing key withheld. Re-pair if the TV was reset or updated.`));
+      cert = fp;
+      const key = rec?.key && (rec.cert || rec.host === target.host) ? rec.key : undefined;
+      conn.send(JSON.stringify({
+        type: "register", id: "reg",
+        payload: { forcePairing: false, pairingType: "PROMPT", "client-key": key, manifest: { manifestVersion: 1, permissions } },
+      }));
+    });
+    const onMessage = (text: string) => {
+      let m: any;
+      try { m = JSON.parse(text); } catch { return fail(new Error("unreadable message from the TV")); }
+      if (m.id !== "reg") return;
+      if (m.type === "error") return fail(new Error(`TV refused pairing: ${m.error}`));
+      if (m.type !== "registered") return console.error(`Waiting: accept the pairing prompt on the TV at ${target.host}...`);
+      const k = m.payload?.["client-key"];
+      if (typeof k !== "string" || !k) return fail(new Error("TV sent no client key"));
+      done = true;
+      clearTimeout(timer);
+      conn.off("message", onMessage);
+      saveState((s) => (s.tvs[target.id] = { ...s.tvs[target.id], host: target.host, cert, key: k }));
+      resolve(new Session(target, conn));
+    };
+    conn.on("message", onMessage);
   });
 }
 
-// Remote-control button press via the TV's pointer socket (UP, DOWN, LEFT, RIGHT, ENTER, BACK, HOME, ...).
-// ponytail: fresh socket per press (~2 round trips). Keep it open if you need fast key repeat.
-export async function button(host: string, name: string): Promise<void> {
-  const [r] = await ask(host, [["ssap://com.webos.service.networkinput/getPointerInputSocket"]], 10_000);
-  if (!r.ok) throw new Error(`pointer socket: ${r.payload}`);
-  await new Promise<void>((resolve, reject) => {
-    const ws = new WebSocket(r.payload.socketPath);
-    ws.onerror = () => reject(new Error("pointer socket connection failed"));
-    ws.onopen = () => {
-      ws.send(`type:button\nname:${name}\n\n`);
-      setTimeout(() => (ws.close(), resolve()), 100); // let the frame flush before closing
-    };
-  });
+// One-shot: connect, send every request, close. Rejects only if the connection or pairing fails.
+export async function ask(target: Target, reqs: Req[], timeoutMs = 90_000): Promise<Res[]> {
+  const s = await connect(target, { timeoutMs });
+  try {
+    return await Promise.all(reqs.map(([uri, payload]) => s.request(uri, payload, timeoutMs)));
+  } finally {
+    s.close();
+  }
 }
 
-// Power on: Wake-on-LAN magic packet (needs "Turn on via Wi-Fi/LAN" enabled on the TV).
+// --- Power on: Wake-on-LAN (needs "Turn on via Wi-Fi/LAN" enabled on the TV) ---
 export function magicPacket(mac: string): Buffer {
   const hex = mac.replace(/[^0-9a-f]/gi, "");
   if (hex.length !== 12) throw new Error("MAC must look like aa:bb:cc:dd:ee:ff");
@@ -141,18 +280,18 @@ export function parseSsdp(text: string): Record<string, string> {
   return h;
 }
 
-// Fold one SSDP answer into the map of TVs found so far. Only webOS answers create an entry.
-export function absorb(found: Map<string, Tv & { location?: string }>, macs: Map<string, string>, host: string, text: string) {
+// Fold one SSDP answer into the TVs found so far. Only webOS answers create an entry.
+export function absorb(found: Map<string, Found & { location?: string }>, macs: Map<string, string>, host: string, text: string) {
   const h = parseSsdp(text);
-  if (h.st === SECOND_SCREEN && !found.has(host)) found.set(host, { host, id: h.usn?.match(/uuid:([^:]+)/)?.[1], location: h.location });
+  if (h.st === SECOND_SCREEN && !found.has(host)) found.set(host, { host, uuid: h.usn?.match(/uuid:([^:]+)/)?.[1], location: h.location });
   const mac = h.wakeup?.match(/MAC=([0-9a-f]{2}(?::[0-9a-f]{2}){5})/i)?.[1];
   if (mac) macs.set(host, mac.toLowerCase());
 }
 
 const tag = (xml: string, t: string) => xml.match(new RegExp(`<${t}>([^<]*)</${t}>`))?.[1];
 
-export async function discover(timeoutMs = 3000): Promise<Tv[]> {
-  const found = new Map<string, Tv & { location?: string }>(), macs = new Map<string, string>();
+export async function discover(timeoutMs = 3000): Promise<Found[]> {
+  const found = new Map<string, Found & { location?: string }>(), macs = new Map<string, string>();
   const sock = createSocket("udp4");
   sock.on("message", (buf, rinfo) => absorb(found, macs, rinfo.address, buf.toString()));
   await new Promise<void>((r) => sock.bind(r));
@@ -175,7 +314,7 @@ export async function discover(timeoutMs = 3000): Promise<Tv[]> {
         tv.model = tag(xml, "modelNumber");
       }
     } catch {} // name is cosmetic; the TV is still usable without it
-    return tv;
+    return defined(tv);
   }));
 }
 
@@ -190,7 +329,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.error("No TV found. Set LGTV_HOST=<ip> or check the TV is on and on this network.");
     process.exit(1);
   }
-  const [r] = await ask(host, [[first, JSON.parse(payload)]]).catch((e) => {
+  const known = Object.entries(loadState().tvs).find(([, r]) => r.host === host)?.[0];
+  const [r] = await ask({ id: known ?? `host:${host}`, host }, [[first, JSON.parse(payload)]]).catch((e) => {
     console.error(e.message);
     process.exit(1);
   });

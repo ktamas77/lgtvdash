@@ -15,14 +15,22 @@
   header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   h1 { margin: 0; font-size: 22px; }
   h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
-  button { font: inherit; padding: 6px 14px; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 6px; cursor: pointer; }
+  button, input, select { font: inherit; color: var(--fg); }
+  button { padding: 6px 14px; border: 1px solid var(--line); background: var(--card); border-radius: 6px; cursor: pointer; }
+  input[type=text] { padding: 6px 10px; border: 1px solid var(--line); background: var(--bg); border-radius: 6px; min-width: 0; flex: 1; }
   #status { color: var(--muted); }
+  #live { font-size: 12px; color: var(--muted); }
+  #live.on { color: var(--ok); }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  #tools { margin-bottom: 14px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
   .wide { grid-column: 1 / -1; }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
   dt { color: var(--muted); }
   dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  form, .row { display: flex; gap: 6px; align-items: center; }
+  form + .row, .row + .row, form + form { margin-top: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
   .bar { display: flex; align-items: center; gap: 8px; }
   .bar span { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--fg); }
@@ -35,6 +43,9 @@
   button:active { transform: translateY(1px); }
   button.link { border: 0; background: none; padding: 0; text-align: left; }
   button.link:hover { text-decoration: underline; }
+  #pad { height: 140px; margin-top: 10px; border: 1px dashed var(--muted); border-radius: 8px; display: grid; place-items: center;
+         color: var(--muted); font-size: 12px; touch-action: none; user-select: none; cursor: crosshair; }
+  #pad:active { background: var(--line); }
   .remote { display: grid; grid-template-columns: repeat(3, 64px); gap: 6px; justify-content: center; }
   .remote button { height: 44px; padding: 0; }
   .media { display: flex; gap: 6px; justify-content: center; margin-top: 12px; }
@@ -44,7 +55,7 @@
   .app:hover { background: var(--line); }
   .app img { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; background: var(--line); display: block; margin: 0 auto 4px; }
   table { width: 100%; border-collapse: collapse; }
-  td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
   td:last-child { text-align: right; color: var(--muted); }
   details { margin-top: 8px; }
   summary { cursor: pointer; color: var(--muted); }
@@ -55,11 +66,26 @@
 <main>
   <header>
     <h1 id="title">LG TV</h1>
-    <div class="actions"><span id="status">Loading…</span>
+    <div class="actions"><span id="live" title="Live updates from the TV"></span><span id="status">Loading…</span>
       <select id="tv" aria-label="TV"></select><button id="scan">Scan</button>
       <button data-cmd="powerOn">Power on</button><button data-cmd="powerOff">Power off</button>
       <button id="reload">Refresh</button></div>
   </header>
+
+  <!-- Static, so live re-renders never wipe what you're typing. -->
+  <div class="grid" id="tools">
+    <section class="card"><h2>Message on TV</h2>
+      <form data-form="alert"><input type="text" maxlength="200" placeholder="Shown as a pop-up with an OK button" aria-label="Message"><button>Show</button></form>
+    </section>
+    <section class="card"><h2>YouTube</h2>
+      <form data-form="youtube"><input type="text" maxlength="300" placeholder="YouTube link or video id" aria-label="YouTube link"><button>Play</button></form>
+    </section>
+    <section class="card"><h2>Type &amp; trackpad</h2>
+      <form data-form="text"><input type="text" maxlength="500" placeholder="Types into the focused field on the TV" aria-label="Text to type"><button>Send</button></form>
+      <div class="row"><button data-cmd="key" data-arg="backspace">⌫ Backspace</button><button data-cmd="key" data-arg="enter">⏎ Enter</button></div>
+      <div id="pad" role="application" aria-label="Trackpad: drag to move the TV pointer, tap to click, scroll to scroll">drag to move · tap to click · scroll</div>
+    </section>
+  </div>
   <div class="grid" id="grid"></div>
 </main>
 <script>
@@ -70,77 +96,86 @@ const bar = (v) => { const n = Number(v) || 0; return `<div class="bar"><span><i
 const rows = (pairs) => `<dl>${pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
 const card = (title, body, cls = "") => `<section class="card ${cls}"><h2>${title}</h2>${body}</section>`;
 const setting = (r, k) => val(r, (p) => esc(p.settings[k]));
+const status = (html) => ($("#status").innerHTML = html);
+const err = (msg) => status(`<span class="err">${esc(msg)}</span>`);
 
-let tvs = [], current = null;
+let tvs = [], current = null, view = {}; // view: what's rendered now (inputs, apps, foreground app)
 // Remember the chosen TV per browser. Storage can be unavailable (private mode), so it's best effort.
 const remembered = () => { try { return localStorage.getItem("tv"); } catch { return null; } };
-const remember = (host) => { try { localStorage.setItem("tv", host); } catch {} };
+const remember = (id) => { try { localStorage.setItem("tv", id); } catch {} };
 const tvName = (t) => t?.name ?? t?.host ?? "LG TV";
+const currentTv = () => tvs.find((t) => t.id === current);
 
 async function loadTvs(scan = false) {
-  if (scan) $("#status").textContent = "Scanning…";
+  if (scan) status("Scanning…");
   const res = await (scan
     ? fetch("/api/scan", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
     : fetch("/api/tvs"));
   tvs = await res.json();
-  if (!tvs.some((t) => t.host === current))
-    current = (tvs.find((t) => t.host === remembered()) ?? tvs.find((t) => t.online) ?? tvs[0])?.host ?? null;
+  if (!tvs.some((t) => t.id === current))
+    current = (tvs.find((t) => t.id === remembered()) ?? tvs.find((t) => t.online) ?? tvs[0])?.id ?? null;
   $("#tv").innerHTML = tvs.map((t) =>
-    `<option value="${esc(t.host)}"${t.host === current ? " selected" : ""}>${t.online ? "● " : "○ "}${esc(tvName(t))} (${esc(t.host)})</option>`
+    `<option value="${esc(t.id)}"${t.id === current ? " selected" : ""}>${t.online ? "● " : "○ "}${esc(tvName(t))} (${esc(t.host)})</option>`
   ).join("") || "<option>No TVs</option>";
   $("#tv").disabled = !tvs.length;
 }
 
-// Shown even when the selected TV is off, so you can switch TVs or power it on.
+// Shown even when the selected TV is off, so you can switch TVs, re-pair, or power it on.
 function tvsCard() {
   return card(`TVs (${tvs.length})`, tvs.length ? `<table>${tvs.map((t) =>
-    `<tr><td><button class="link" data-select="${esc(t.host)}">${t.host === current ? "▶ " : ""}${esc(tvName(t))}</button>
-       <div style="color:var(--muted);font-size:12px">${esc(t.host)} · ${esc(t.model)} · ${esc(t.mac ?? "no MAC")}</div></td>
-     <td>${t.sources.map(esc).join(" + ")}<br>${t.online ? '<span class="on">on network</span>' : "not seen"}${t.paired ? "" : " · not paired"}</td></tr>`
+    `<tr><td><button class="link" data-select="${esc(t.id)}">${t.id === current ? "▶ " : ""}${esc(tvName(t))}</button>
+       <div class="hint" style="margin:0">${esc(t.host)} · ${esc(t.model)} · ${esc(t.mac ?? "no MAC")}</div>
+       ${t.certChanged ? `<div class="err" style="font-size:12px">Certificate changed: key withheld.</div><button data-forget="${esc(t.id)}">Re-pair</button>` : ""}</td>
+     <td>${t.sources.map(esc).join(" + ")}<br>${t.online ? '<span class="on">on network</span>' : "not seen"}
+       <br>${t.paired ? (t.certPinned ? "paired · 🔒 pinned" : "paired") : "not paired"}</td></tr>`
   ).join("")}</table>` : `<p>No TVs yet. Press <b>Scan</b> with the TV on, or add one to <code>tvs.json</code>.</p>`);
 }
 
 async function load() {
-  const t = tvs.find((t) => t.host === current);
+  const t = currentTv();
   $("#title").textContent = document.title = tvName(t);
   if (!t) {
     $("#grid").innerHTML = tvsCard();
-    $("#status").textContent = "";
-    return;
+    status("");
+    return live(null);
   }
-  $("#status").textContent = t.paired ? "Loading…" : "Connecting… (first time: accept the pairing prompt on the TV)";
+  status(t.paired ? "Loading…" : "Connecting… (first time: accept the pairing prompt on the TV)");
   // Never show one TV's data under another TV's name while the new one loads (an offline TV takes ~10s to fail).
-  if ($("#grid").dataset.tv !== t.host) $("#grid").innerHTML = tvsCard();
-  $("#grid").dataset.tv = t.host;
+  if ($("#grid").dataset.tv !== t.id) $("#grid").innerHTML = tvsCard();
+  $("#grid").dataset.tv = t.id;
   try {
-    const res = await fetch("/api/info?tv=" + encodeURIComponent(t.host));
+    const res = await fetch("/api/info?tv=" + encodeURIComponent(t.id));
     const d = await res.json();
     if (!res.ok) throw new Error(d.error);
-    if (t.host !== current) return; // switched TVs while this was loading
+    if (t.id !== current) return; // switched TVs while this was loading
     render(d);
-    $("#status").textContent = "Updated " + new Date().toLocaleTimeString();
-    if (!t.paired) loadTvs();
+    status("Updated " + new Date().toLocaleTimeString());
+    if (!t.paired || !t.certPinned) loadTvs().then(() => $("#grid").dataset.tv === t.id && refreshTvsCard());
+    live(t.id);
   } catch (e) {
-    if (t.host !== current) return;
+    if (t.id !== current) return;
+    await loadTvs(); // picks up "certificate changed"
     $("#grid").innerHTML = tvsCard() + card("Not reachable", `<p class="err">${esc(e.message)}</p><p>The TV may be off. Use <b>Power on</b> if it has a MAC.</p>`);
-    $("#status").textContent = "";
+    status("");
+    live(t.id); // reconnects by itself and reloads when the TV is back
   }
 }
 
+const refreshTvsCard = () => { const c = $("#tvs-card"); if (c) c.outerHTML = tvsCard().replace("<section", '<section id="tvs-card"'); };
+
 function render(d) {
-  const name = d.netSettings.ok ? d.netSettings.payload.settings.deviceName : tvName(tvs.find((t) => t.host === current));
-  $("#title").textContent = name;
-  document.title = name;
+  const name = d.netSettings.ok ? d.netSettings.payload.settings.deviceName : tvName(currentTv());
+  $("#title").textContent = document.title = name;
   const inputs = d.inputs.ok ? d.inputs.payload.devices : [];
-  const fgApp = d.foreground.ok ? d.foreground.payload.appId : "";
-  const fgInput = inputs.find((i) => i.appId === fgApp);
+  const apps = d.apps.ok ? d.apps.payload.launchPoints : [];
+  view = { inputs, apps, fg: d.foreground.ok ? d.foreground.payload.appId : "" };
   const t = d.time.ok ? d.time.payload.time : null;
   const pad = (n) => String(Number(n) || 0).padStart(2, "0");
 
   $("#grid").innerHTML = [
     card("Status", rows([
-      ["Power", val(d.power, (p) => `<span class="on">${esc(p.state)}</span>`)],
-      ["Showing", val(d.foreground, (p) => esc(fgInput ? `${fgInput.label} (${p.appId})` : p.appId))],
+      ["Power", `<span id="power">${val(d.power, (p) => `<span class="on">${esc(p.state)}</span>`)}</span>`],
+      ["Showing", `<span id="showing">${val(d.foreground, (p) => esc(showing(p.appId)))}</span>`],
       ["Volume", val(d.volume, (p) =>
         `<div class="bar"><input id="vol" type="range" min="0" max="100" value="${Number(p.volume) || 0}" aria-label="Volume"><output id="volOut">${Number(p.volume) || 0}</output>
          <button id="mute" aria-pressed="${p.muted === true}">${p.muted ? "Unmute" : "Mute"}</button></div>`)],
@@ -160,16 +195,14 @@ function render(d) {
       ["Contrast", val(d.contrast, (p) => bar(p.settings.contrast))],
       ["Brightness", val(d.brightness, (p) => bar(p.settings.brightness))],
       ["Color", val(d.color, (p) => bar(p.settings.color))],
-    ]) + `<p style="color:var(--muted);margin:10px 0 0;font-size:12px">Read-only: the TV refuses picture changes from third-party apps (401). Picture mode, sharpness, color temperature and energy saving are not readable either.</p>`),
+    ]) + `<p class="hint">Read-only: the TV refuses picture changes from third-party apps (401). Picture mode, sharpness, color temperature and energy saving are not readable either.</p>`),
     card("Network", rows([
       ["Wi-Fi MAC", val(d.network, (p) => esc(p.wifiInfo?.macAddress))],
       ["Wired MAC", val(d.network, (p) => esc(p.wiredInfo?.macAddress))],
       ["Wi-Fi Direct MAC", val(d.network, (p) => esc(p.P2PInfo?.macAddress))],
       ["Wake-on-LAN", val(d.netSettings, (p) => esc(p.settings.wolwowlOnOff))],
     ])),
-    card("Inputs", `<table>${inputs.map((i) =>
-      `<tr><td><button class="link" data-cmd="input" data-arg="${esc(i.id)}">${i.appId === fgApp ? "▶ " : ""}${esc(i.label)}</button></td><td class="${i.connected ? "on" : ""}">${i.connected ? "connected" : "—"}</td></tr>`
-    ).join("") || `<tr><td>${val(d.inputs)}</td></tr>`}</table>`),
+    card("Inputs", `<table id="inputs">${inputsRows()}</table>`),
     card("Remote", `<div class="remote">
       <span></span><button data-cmd="button" data-arg="UP" aria-label="Up">▲</button><span></span>
       <button data-cmd="button" data-arg="LEFT" aria-label="Left">◀</button><button data-cmd="button" data-arg="ENTER">OK</button><button data-cmd="button" data-arg="RIGHT" aria-label="Right">▶</button>
@@ -179,12 +212,9 @@ function render(d) {
       ${[["rewind", "⏪", "Rewind"], ["play", "▶", "Play"], ["pause", "⏸", "Pause"], ["stop", "⏹", "Stop"], ["fastForward", "⏩", "Fast forward"]]
         .map(([m, s, l]) => `<button data-cmd="media" data-arg="${m}" aria-label="${l}">${s}</button>`).join("")}
     </div>`),
-    tvsCard(),
+    tvsCard().replace("<section", '<section id="tvs-card"'),
     card("Services", val(d.services, (p) => p.services.map((s) => `${esc(s.name)} v${esc(s.version)}`).join(", "))),
-    card(`Apps (${d.apps.ok ? d.apps.payload.launchPoints.length : "?"})`, val(d.apps, (p) =>
-      `<div class="apps">${p.launchPoints.map((a) =>
-        `<button class="app" data-cmd="launch" data-arg="${esc(a.id)}"><img loading="lazy" alt="" src="${esc(a.mediumLargeIcon?.startsWith("http") ? a.mediumLargeIcon : a.icon)}">${a.id === fgApp ? "▶ " : ""}${esc(a.title)}</button>`
-      ).join("")}</div>`), "wide"),
+    card(`Apps (${apps.length || "?"})`, val(d.apps, () => `<div class="apps" id="apps">${appsTiles()}</div>`), "wide"),
     card("Model config (tv.model.*)", val(d.config, (p) =>
       `<details><summary>${Object.keys(p.configs).length} flags</summary><pre>${esc(JSON.stringify(p.configs, null, 2))}</pre></details>`), "wide"),
     card("Raw responses", `<details><summary>All ${Object.keys(d).length} calls</summary><pre>${esc(JSON.stringify(d, null, 2))}</pre></details>`, "wide"),
@@ -195,54 +225,148 @@ function render(d) {
     vol.oninput = () => ($("#volOut").textContent = vol.value);
     // ponytail: sends on release (change), not on every drag step; the TV is slow per call.
     vol.onchange = () => cmd("volume", Number(vol.value));
-    mute.onclick = async () => {
-      const next = mute.getAttribute("aria-pressed") !== "true";
-      if (await cmd("mute", next)) {
-        mute.setAttribute("aria-pressed", next);
-        mute.textContent = next ? "Unmute" : "Mute";
-      }
-    };
+    mute.onclick = () => cmd("mute", mute.getAttribute("aria-pressed") !== "true"); // live update flips the button
   }
 }
 
-async function cmd(action, arg) {
-  $("#status").textContent = "Sending…";
+const showing = (appId) => {
+  const i = view.inputs?.find((i) => i.appId === appId), a = view.apps?.find((a) => a.id === appId);
+  return i ? `${i.label} (${appId})` : a ? `${a.title} (${appId})` : appId;
+};
+const inputsRows = () => view.inputs.map((i) =>
+  `<tr><td><button class="link" data-cmd="input" data-arg="${esc(i.id)}">${i.appId === view.fg ? "▶ " : ""}${esc(i.label)}</button></td><td class="${i.connected ? "on" : ""}">${i.connected ? "connected" : "—"}</td></tr>`
+).join("");
+// Over wss the TV hands out icon URLs on https://<tv>:3001 (self-signed, so browsers refuse them).
+// The same files are served on plain http://<tv>:3000; app icons aren't sensitive.
+const iconUrl = (a) => String(a.mediumLargeIcon?.startsWith("http") ? a.mediumLargeIcon : a.icon ?? "").replace(/^https:\/\/([^/:]+):3001\//, "http://$1:3000/");
+const appsTiles = () => view.apps.map((a) =>
+  `<button class="app" data-cmd="launch" data-arg="${esc(a.id)}"><img loading="lazy" alt="" src="${esc(iconUrl(a))}">${a.id === view.fg ? "▶ " : ""}${esc(a.title)}</button>`
+).join("");
+
+// --- Live updates (server-sent events): volume, foreground app, power state ---
+let es = null, esTv = null, wasOffline = false;
+function live(id) {
+  if (esTv === id && es) return;
+  es?.close();
+  es = null;
+  esTv = id;
+  $("#live").textContent = "";
+  $("#live").className = "";
+  if (!id) return;
+  es = new EventSource("/api/events?tv=" + encodeURIComponent(id));
+  es.onopen = () => { $("#live").textContent = "● live"; $("#live").className = "on"; };
+  es.onerror = () => { $("#live").textContent = "○ reconnecting"; $("#live").className = ""; };
+  es.onmessage = (m) => {
+    if (esTv !== current) return;
+    const e = JSON.parse(m.data);
+    if (e.kind === "offline") {
+      wasOffline = true;
+      $("#live").textContent = "○ TV offline";
+      $("#live").className = "";
+      if ($("#power")) $("#power").innerHTML = `<span class="err">offline</span>`;
+      return;
+    }
+    if (wasOffline) { wasOffline = false; return load(); } // back: full refresh
+    if (!e.ok) return;
+    if (e.kind === "volume") {
+      const vol = $("#vol"), mute = $("#mute");
+      if (vol && document.activeElement !== vol && Number.isFinite(e.payload.volume)) {
+        vol.value = e.payload.volume;
+        $("#volOut").textContent = e.payload.volume;
+      }
+      if (mute && typeof e.payload.muted === "boolean") {
+        mute.setAttribute("aria-pressed", e.payload.muted);
+        mute.textContent = e.payload.muted ? "Unmute" : "Mute";
+      }
+    } else if (e.kind === "power" && $("#power")) {
+      $("#power").innerHTML = `<span class="${e.payload.state === "Active" ? "on" : ""}">${esc(e.payload.state)}</span>`;
+    } else if (e.kind === "foreground" && e.payload.appId && e.payload.appId !== view.fg && view.inputs) {
+      view.fg = e.payload.appId;
+      $("#showing").textContent = showing(view.fg);
+      $("#inputs").innerHTML = inputsRows();
+      if ($("#apps")) $("#apps").innerHTML = appsTiles();
+    }
+  };
+}
+
+async function cmd(action, arg, { quiet = false, tv = current } = {}) {
+  if (!quiet) status("Sending…");
   try {
-    const res = await fetch("/api/cmd", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tv: current, action, arg }) });
+    const res = await fetch("/api/cmd", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tv, action, arg }) });
     const r = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(r.error ?? res.statusText);
-    $("#status").textContent = "Sent " + new Date().toLocaleTimeString();
+    if (!quiet) status("Sent " + new Date().toLocaleTimeString());
     return true;
   } catch (e) {
-    $("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    err(e.message);
     return false;
   }
 }
 
-// Any element with data-cmd sends that action; input/app/power changes refresh the view afterwards.
-const select = (host) => {
-  current = host;
-  remember(host);
-  $("#tv").value = host;
+const select = (id) => {
+  current = id;
+  remember(id);
+  $("#tv").value = id;
   load();
 };
 $("#tv").onchange = () => select($("#tv").value);
 $("#scan").onclick = async () => { await loadTvs(true); load(); };
+$("#reload").onclick = load;
 
+// Any element with data-cmd sends that action.
 document.addEventListener("click", async (e) => {
   const pick = e.target.closest("[data-select]");
   if (pick) return select(pick.dataset.select);
+  const forget = e.target.closest("[data-forget]");
+  if (forget) {
+    if (!confirm("Forget this TV's key and certificate? The TV will ask to pair again.")) return;
+    if (await cmd("forget", undefined, { tv: forget.dataset.forget })) { await loadTvs(); load(); }
+    return;
+  }
   const el = e.target.closest("[data-cmd]");
-  if (!el) return;
+  if (!el || !current) return;
   const { cmd: action, arg } = el.dataset;
-  if (!current) return;
-  if (action === "powerOff" && !confirm(`Turn off ${tvName(tvs.find((t) => t.host === current))}?`)) return;
-  if (await cmd(action, arg) && ["input", "launch", "powerOff", "powerOn"].includes(action))
-    setTimeout(load, action === "powerOn" ? 8000 : 1500);
+  if (action === "powerOff" && !confirm(`Turn off ${tvName(currentTv())}?`)) return;
+  if (await cmd(action, arg) && action === "powerOn") setTimeout(load, 8000); // live updates cover the rest
 });
 
-$("#reload").onclick = load;
-loadTvs().then(load, (e) => ($("#status").innerHTML = `<span class="err">${esc(e.message)}</span>`));
+// Message / YouTube / typing boxes.
+document.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target, input = form.querySelector("input");
+  if (!current || !input.value.trim()) return;
+  if (await cmd(form.dataset.form, input.value)) input.value = "";
+});
+
+// Trackpad: pointer moves are batched (one request in flight at a time); a tap clicks; wheel scrolls.
+const padEl = $("#pad");
+let last = null, travel = 0, acc = { dx: 0, dy: 0 }, wheel = 0, busy = false;
+const clamp = (n) => Math.max(-500, Math.min(500, Math.round(n)));
+async function flush() {
+  if (busy || !current) return;
+  const move = { dx: clamp(acc.dx * 1.5), dy: clamp(acc.dy * 1.5) }, dy = clamp(wheel);
+  acc = { dx: 0, dy: 0 };
+  wheel = 0;
+  if (!move.dx && !move.dy && !dy) return;
+  busy = true;
+  if (move.dx || move.dy) await cmd("pointer", move, { quiet: true });
+  if (dy) await cmd("scroll", { dy }, { quiet: true });
+  busy = false;
+  if (acc.dx || acc.dy || wheel) flush();
+}
+setInterval(flush, 50);
+padEl.onpointerdown = (e) => { padEl.setPointerCapture(e.pointerId); last = { x: e.clientX, y: e.clientY }; travel = 0; };
+padEl.onpointermove = (e) => {
+  if (!last) return;
+  const dx = e.clientX - last.x, dy = e.clientY - last.y;
+  last = { x: e.clientX, y: e.clientY };
+  acc.dx += dx; acc.dy += dy; travel += Math.abs(dx) + Math.abs(dy);
+};
+padEl.onpointerup = () => { if (last && travel < 5) cmd("click", undefined, { quiet: true }); last = null; };
+padEl.onpointercancel = () => (last = null);
+padEl.addEventListener("wheel", (e) => { e.preventDefault(); wheel += e.deltaY; }, { passive: false });
+
+loadTvs().then(load, (e) => err(e.message));
 </script>
 </body>
 </html>

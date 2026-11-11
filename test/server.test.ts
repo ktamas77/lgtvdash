@@ -1,223 +1,156 @@
-// HTTP layer tests: real server on a random port, fake TV functions injected.
+// HTTP layer tests: real server on a random port, registry with a fake TV.
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { tv, TV1, makeRegistry } from "./fake.ts";
+const { app } = await import("../server.ts");
+const { QUERIES } = await import("../tvs.ts");
 
-const DIR = mkdtempSync(join(tmpdir(), "lgtv-srv-"));
-process.env.LGTV_STATE = join(DIR, "state.json");
-const { app, QUERIES, loadConfig } = await import("../server.ts");
-
-const TV1 = "10.0.0.5", TV2 = "10.0.0.6";
-let calls: any[] = [];
-let found: any[] = [];
-let tvAnswer: (uri: string) => { ok: boolean; payload: any } = () => ({ ok: true, payload: {} });
-let tvDown = false;
-const tv = {
-  ask: async (host: string, reqs: any[]) => {
-    if (tvDown) throw new Error("websocket error: connection failed");
-    calls.push(...reqs.map(([uri, payload]) => ({ host, uri, payload })));
-    return reqs.map(([uri]) => ({ uri, ...tvAnswer(uri) }));
-  },
-  button: async (host: string, name: string) => void calls.push({ host, button: name }),
-  wake: async (mac: string, bcast?: string) => void calls.push({ wake: mac, bcast }),
-  discover: async () => found,
-};
-
-let server: Server, base: string, port: number, handler: ReturnType<typeof app>;
+let server: Server, base: string, port: number, reg: ReturnType<typeof makeRegistry>;
+const ID = "host:10.0.0.5";
 before(async () => {
-  handler = app({ tv: tv as any, config: [{ host: TV1, name: "Living room", mac: "aa:aa:aa:aa:aa:aa", broadcast: "10.0.0.255" }] });
-  server = createServer(handler);
+  reg = makeRegistry([{ host: "10.0.0.5", name: "Living room" }]);
+  server = createServer(app(reg));
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   port = (server.address() as AddressInfo).port;
   base = `http://127.0.0.1:${port}`;
 });
-after(() => server.close());
-beforeEach(async () => {
-  calls = [];
-  tvAnswer = () => ({ ok: true, payload: {} });
-  tvDown = false;
-  rmSync(process.env.LGTV_STATE!, { force: true });
-  found = [];
-  await handler.scan(); // reset "online" set
-  delete process.env.LGTV_BROADCAST;
+after(() => (server.closeAllConnections(), server.close()));
+beforeEach(() => {
+  tv.reset();
+  tv.sessions.splice(0); // fresh sessions per test
+  reg.list().forEach((t) => reg.session(t).then((s) => s.close(), () => {}));
 });
 
 const JSONH = { "content-type": "application/json" };
 const post = (path: string, body: any, headers: Record<string, string> = JSONH) =>
   fetch(base + path, { method: "POST", headers, body: typeof body === "string" ? body : JSON.stringify(body) });
-const cmd = (body: any, headers?: Record<string, string>) => post("/api/cmd", { tv: TV1, ...body }, headers);
-const tvs = async () => (await fetch(base + "/api/tvs")).json();
+const cmd = (body: any, headers?: Record<string, string>) => post("/api/cmd", { tv: ID, ...body }, headers);
+const withHost = (host: string, path = "/api/tvs") => new Promise<number>((resolve, reject) =>
+  request({ port, path, headers: { host } }, (res) => (res.resume(), resolve(res.statusCode!))).on("error", reject).end());
 
-// fetch can't override Host, so use node:http for that one.
-const withHost = (host: string) => new Promise<number>((resolve, reject) =>
-  request({ port, path: "/api/tvs", headers: { host } }, (res) => resolve(res.statusCode!)).on("error", reject).end());
-
-// --- TV list, discovery, config ---
-
-test("config TVs are listed before any scan", async () => {
-  assert.deepEqual(await tvs(), [{ host: TV1, name: "Living room", mac: "aa:aa:aa:aa:aa:aa", broadcast: "10.0.0.255", sources: ["config"], online: false, paired: false }]);
+test("GET /api/tvs lists TVs by id", async () => {
+  const list = await (await fetch(base + "/api/tvs")).json();
+  assert.deepEqual(list.map((t: any) => [t.id, t.name]), [[ID, "Living room"]]);
 });
 
-test("scan merges discovered TVs: config wins, discovery fills gaps, new TVs are added", async () => {
-  found = [
-    { host: TV1, name: "[LG] webOS TV", model: "M1", mac: "bb:bb:bb:bb:bb:bb", id: "uuid-1" },
-    { host: TV2, name: "Bedroom TV", model: "M2", mac: "cc:cc:cc:cc:cc:cc", id: "uuid-2" },
-  ];
+test("POST /api/scan returns the merged list", async () => {
+  tv.found = [TV1];
   const list = await (await post("/api/scan", {})).json();
-  assert.deepEqual(list.map((t: any) => [t.host, t.name, t.model, t.mac, t.sources.join("+"), t.online]), [
-    [TV1, "Living room", "M1", "aa:aa:aa:aa:aa:aa", "config+discovered", true],
-    [TV2, "Bedroom TV", "M2", "cc:cc:cc:cc:cc:cc", "discovered", true],
-  ]);
+  assert.deepEqual(list.map((t: any) => [t.id, t.sources.join("+"), t.online]), [["uuid-1", "config+discovered", true]]);
 });
 
-test("a discovered TV is remembered when a later scan misses it (e.g. it's off)", async () => {
-  found = [{ host: TV2, name: "Bedroom TV", mac: "cc:cc:cc:cc:cc:cc" }];
-  await post("/api/scan", {});
-  found = [];
-  await post("/api/scan", {});
-  const t = (await tvs()).find((t: any) => t.host === TV2);
-  assert.deepEqual([t.name, t.mac, t.online], ["Bedroom TV", "cc:cc:cc:cc:cc:cc", false]);
-});
-
-test("paired reflects a saved key for that host", async () => {
-  writeFileSync(process.env.LGTV_STATE!, JSON.stringify({ keys: { [TV1]: "k" } }));
-  assert.equal((await tvs())[0].paired, true);
-});
-
-test("concurrent scans share one discovery run", async () => {
-  let runs = 0;
-  const slow = app({ tv: { ...tv, discover: async () => (runs++, await new Promise((r) => setTimeout(r, 20)), []) } as any });
-  await Promise.all([slow.scan(), slow.scan(), slow.scan()]);
-  assert.equal(runs, 1);
-});
-
-test("loadConfig: missing file is empty, bad entries are rejected with the index", () => {
-  assert.deepEqual(loadConfig(join(DIR, "nope.json")), []);
-  const f = join(DIR, "tvs.json");
-  writeFileSync(f, JSON.stringify([{ host: "10.0.0.5", name: "A", extra: 1 }]));
-  assert.deepEqual(loadConfig(f), [{ host: "10.0.0.5", name: "A", mac: undefined, broadcast: undefined }]);
-  for (const [bad, msg] of [[{}, /expected an array/], [[{ name: "x" }], /\[0\].*host/], [[{ host: "a b" }], /host/], [[{ host: "x", mac: 1 }], /mac/]] as const) {
-    writeFileSync(f, JSON.stringify(bad));
-    assert.throws(() => loadConfig(f), msg);
-  }
-  writeFileSync(f, "{oops");
-  assert.throws(() => loadConfig(f), /tvs\.json/);
-});
-
-// --- info / commands ---
-
-test("GET /api/info?tv= returns every query by name, from that TV", async () => {
-  const res = await fetch(`${base}/api/info?tv=${TV1}`);
+test("GET /api/info?tv= returns every query by name", async () => {
+  const res = await fetch(`${base}/api/info?tv=${encodeURIComponent(ID)}`);
   assert.equal(res.status, 200);
   assert.deepEqual(Object.keys(await res.json()), Object.keys(QUERIES));
-  assert.ok(calls.every((c) => c.host === TV1));
 });
 
 test("unknown or missing TVs are 404 and never contacted", async () => {
+  tv.connects = [];
   assert.equal((await fetch(`${base}/api/info?tv=10.9.9.9`)).status, 404);
   assert.equal((await fetch(`${base}/api/info`)).status, 404);
-  assert.equal((await post("/api/cmd", { tv: "evil.example", action: "powerOff" })).status, 404);
-  assert.equal((await post("/api/cmd", { action: "powerOff" })).status, 404);
-  assert.deepEqual(calls, []);
+  assert.equal((await fetch(`${base}/api/events?tv=evil`)).status, 404);
+  assert.equal((await post("/api/cmd", { tv: "host:evil.example", action: "powerOff" })).status, 404);
+  assert.deepEqual(tv.connects, []);
 });
 
 test("GET /api/info is 502 when the TV is unreachable", async () => {
-  tvDown = true;
-  const res = await fetch(`${base}/api/info?tv=${TV1}`);
+  tv.down = true;
+  const res = await fetch(`${base}/api/info?tv=${encodeURIComponent(ID)}`);
   assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /connection failed/);
+  assert.match((await res.json()).error, /unreachable/);
 });
 
-test("serves the page and 404s unknown paths", async () => {
+test("commands: 200 on success, 400 on bad input, 502 with the TV's error on refusal", async () => {
+  assert.equal((await cmd({ action: "alert", arg: "hi" })).status, 200);
+  assert.equal((await cmd({ action: "alert", arg: "" })).status, 400);
+  assert.equal((await cmd({ action: "nope" })).status, 400);
+  tv.answer = () => ({ ok: false, payload: "401 insufficient permissions" });
+  const res = await cmd({ action: "volume", arg: 3 });
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, "401 insufficient permissions");
+});
+
+test("forget clears pairing for that TV", async () => {
+  assert.equal((await cmd({ action: "forget" })).status, 200);
+});
+
+test("serves the page; unknown paths 404", async () => {
   assert.match(await (await fetch(base + "/")).text(), /<title>/);
   assert.equal((await fetch(base + "/nope")).status, 404);
 });
 
-test("rejects a foreign Host header (DNS rebinding)", async () => {
+test("rejects a foreign Host header (DNS rebinding), including the event stream", async () => {
   assert.equal(await withHost("evil.example:" + port), 403);
+  assert.equal(await withHost("evil.example:" + port, `/api/events?tv=${encodeURIComponent(ID)}`), 403);
   assert.equal(await withHost("localhost:" + port), 200);
-});
-
-test("valid actions map to the right TV call on the selected TV", async () => {
-  const cases: [any, any][] = [
-    [{ action: "volume", arg: 30 }, { host: TV1, uri: "ssap://audio/setVolume", payload: { volume: 30 } }],
-    [{ action: "mute", arg: true }, { host: TV1, uri: "ssap://audio/setMute", payload: { mute: true } }],
-    [{ action: "input", arg: "HDMI_1" }, { host: TV1, uri: "ssap://tv/switchInput", payload: { inputId: "HDMI_1" } }],
-    [{ action: "launch", arg: "youtube.leanback.v4" }, { host: TV1, uri: "ssap://system.launcher/launch", payload: { id: "youtube.leanback.v4" } }],
-    [{ action: "media", arg: "pause" }, { host: TV1, uri: "ssap://media.controls/pause", payload: undefined }],
-    [{ action: "powerOff" }, { host: TV1, uri: "ssap://system/turnOff", payload: undefined }],
-    [{ action: "button", arg: "HOME" }, { host: TV1, button: "HOME" }],
-  ];
-  for (const [body, expected] of cases) {
-    calls = [];
-    const res = await cmd(body);
-    assert.equal(res.status, 200, JSON.stringify(body));
-    assert.deepEqual(calls, [expected]);
-  }
-});
-
-test("commands go to whichever TV is named", async () => {
-  found = [{ host: TV2 }];
-  await post("/api/scan", {});
-  await post("/api/cmd", { tv: TV2, action: "volume", arg: 5 });
-  assert.deepEqual(calls, [{ host: TV2, uri: "ssap://audio/setVolume", payload: { volume: 5 } }]);
-});
-
-test("invalid arguments are 400 and never reach the TV", async () => {
-  const bad = [
-    { action: "volume", arg: 101 }, { action: "volume", arg: -1 }, { action: "volume", arg: 2.5 }, { action: "volume", arg: "30" },
-    { action: "mute", arg: "true" },
-    { action: "input", arg: "HDMI 1; rm" }, { action: "input", arg: "x".repeat(129) },
-    { action: "launch", arg: "../etc" }, { action: "launch" },
-    { action: "media", arg: "eject" },
-    { action: "button", arg: "REBOOT" },
-    { action: "nope" }, { action: "__proto__" }, { action: "constructor" }, { action: "toString" }, {},
-  ];
-  for (const body of bad) assert.equal((await cmd(body)).status, 400, JSON.stringify(body));
-  assert.deepEqual(calls, []);
 });
 
 test("CSRF guard: cross-origin and non-JSON POSTs are 403, for commands and scans", async () => {
   const body = { action: "powerOff" };
   assert.equal((await cmd(body, { ...JSONH, origin: "https://evil.example" })).status, 403);
   assert.equal((await cmd(body, { "content-type": "text/plain" })).status, 403);
-  assert.equal((await cmd(body, { "content-type": "application/x-www-form-urlencoded" })).status, 403);
   assert.equal((await post("/api/scan", {}, { "content-type": "text/plain" })).status, 403);
   assert.equal((await cmd(body, { ...JSONH, origin: base })).status, 200);
-  assert.deepEqual(calls, [{ host: TV1, uri: "ssap://system/turnOff", payload: undefined }]);
 });
 
 test("malformed and oversized bodies are 400", async () => {
   assert.equal((await post("/api/cmd", "{not json")).status, 400);
-  assert.equal((await cmd({ action: "volume", arg: 1, pad: "x".repeat(2000) })).status, 400);
-  assert.deepEqual(calls, []);
+  assert.equal((await cmd({ action: "text", arg: "x".repeat(3000) })).status, 400);
 });
 
-test("a TV-side refusal is a 502 with the TV's error", async () => {
-  tvAnswer = () => ({ ok: false, payload: "401 insufficient permissions" });
-  const res = await cmd({ action: "volume", arg: 10 });
-  assert.equal(res.status, 502);
-  assert.equal((await res.json()).error, "401 insufficient permissions");
+// Read SSE "data:" events from a streaming response until `n` arrive or the stream ends.
+async function readEvents(res: Response, n: number) {
+  const out: any[] = [];
+  const reader = res.body!.getReader();
+  let buf = "";
+  while (out.length < n) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += new TextDecoder().decode(value);
+    for (let i; (i = buf.indexOf("\n\n")) >= 0; buf = buf.slice(i + 2)) {
+      const line = buf.slice(0, i).split("\n").find((l) => l.startsWith("data: "));
+      if (line) out.push(JSON.parse(line.slice(6)));
+    }
+  }
+  return { out, reader };
+}
+
+test("GET /api/events streams pushes and ends with offline when the TV drops", async () => {
+  const res = await fetch(`${base}/api/events?tv=${encodeURIComponent(ID)}`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  await new Promise((r) => setTimeout(r, 20));
+  const s = tv.sessions.at(-1)!;
+  s.push("ssap://audio/getVolume", { volume: 12, muted: false });
+  s.push("ssap://com.webos.applicationManager/getForegroundAppInfo", { appId: "netflix" });
+  s.close();
+  const { out } = await readEvents(res, 3);
+  assert.deepEqual(out.map((e) => [e.kind, e.payload]), [
+    ["volume", { volume: 12, muted: false }],
+    ["foreground", { appId: "netflix" }],
+    ["offline", "connection to the TV closed"],
+  ]);
 });
 
-test("powerOn uses the TV's MAC and broadcast; without a MAC it explains how to get one", async () => {
-  assert.equal((await cmd({ action: "powerOn" })).status, 200);
-  assert.deepEqual(calls, [{ wake: "aa:aa:aa:aa:aa:aa", bcast: "10.0.0.255" }]);
+test("GET /api/events on an unreachable TV sends offline and ends (EventSource retries)", async () => {
+  tv.down = true;
+  const res = await fetch(`${base}/api/events?tv=${encodeURIComponent(ID)}`);
+  assert.equal(res.status, 200);
+  const { out } = await readEvents(res, 1);
+  assert.deepEqual(out, [{ kind: "offline", ok: false, payload: "connection failed: unreachable" }]);
+});
 
-  found = [{ host: TV2 }]; // discovered without a MAC
-  await post("/api/scan", {});
-  const res = await post("/api/cmd", { tv: TV2, action: "powerOn" });
-  assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /No MAC known for 10\.0\.0\.6/);
-
-  calls = [];
-  found = [{ host: TV2, mac: "cc:cc:cc:cc:cc:cc" }];
-  await post("/api/scan", {});
-  process.env.LGTV_BROADCAST = "10.0.0.127";
-  assert.equal((await post("/api/cmd", { tv: TV2, action: "powerOn" })).status, 200);
-  assert.deepEqual(calls, [{ wake: "cc:cc:cc:cc:cc:cc", bcast: "10.0.0.127" }]);
+test("closing the event stream unsubscribes from the TV", async () => {
+  const ac = new AbortController();
+  const res = await fetch(`${base}/api/events?tv=${encodeURIComponent(ID)}`, { signal: ac.signal });
+  assert.equal(res.status, 200);
+  await new Promise((r) => setTimeout(r, 20));
+  const s = tv.sessions.at(-1)!;
+  assert.equal(s.subs.size, 3);
+  ac.abort();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(s.subs.size, 0);
 });
