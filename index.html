@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LG TV</title>
 <style>
-  :root { --bg: #f6f6f4; --card: #fff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e4e4df; --ok: #2f7d4f; --bad: #b3412f; }
+  :root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e4e4df; --ok: #2f7d4f; --bad: #b3412f; }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #151514; --card: #1f1f1d; --fg: #ececea; --muted: #9a9a94; --line: #33332f; --ok: #6cc28e; --bad: #e58a78; }
   }
@@ -16,6 +16,7 @@
   h1 { margin: 0; font-size: 22px; }
   h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   button, input, select { font: inherit; color: var(--fg); }
+  select { padding: 6px 10px; border: 1px solid var(--line); background: var(--card); border-radius: 6px; }
   button { padding: 6px 14px; border: 1px solid var(--line); background: var(--card); border-radius: 6px; cursor: pointer; }
   input[type=text] { padding: 6px 10px; border: 1px solid var(--line); background: var(--bg); border-radius: 6px; min-width: 0; flex: 1; }
   #status { color: var(--muted); }
