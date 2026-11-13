@@ -231,7 +231,7 @@ test("actions map to the right TV call", async () => {
     ["media", "pause", { uri: "ssap://media.controls/pause", payload: undefined }],
     ["powerOff", undefined, { uri: "ssap://system/turnOff", payload: undefined }],
     ["alert", "  Dinner's ready  ", { uri: "ssap://system.notifications/createAlert", payload: { message: "Dinner's ready", buttons: [{ label: "OK", focus: true }] } }],
-    ["youtube", "https://youtu.be/dQw4w9WgXcQ", { uri: "ssap://system.launcher/launch", payload: { id: "youtube.leanback.v4", contentTarget: "https://www.youtube.com/tv?v=dQw4w9WgXcQ" } }],
+    ["youtube", "https://youtu.be/dQw4w9WgXcQ", { uri: "ssap://system.launcher/launch", payload: { id: "youtube.leanback.v4", params: { contentTarget: "https://www.youtube.com/tv?v=dQw4w9WgXcQ" } } }],
     ["text", "hello", { uri: "ssap://com.webos.service.ime/insertText", payload: { text: "hello", replace: false } }],
     ["key", "enter", { uri: "ssap://com.webos.service.ime/sendEnterKey", payload: undefined }],
     ["key", "backspace", { uri: "ssap://com.webos.service.ime/deleteCharacters", payload: { count: 1 } }],

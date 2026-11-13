@@ -136,7 +136,7 @@ export const ACTIONS: Record<string, (c: Ctx, arg: any) => Promise<unknown>> = {
   youtube: async (c, url) => {
     const v = parseYouTube(url);
     if (!v) throw 400;
-    return c.req("ssap://system.launcher/launch", { id: "youtube.leanback.v4", contentTarget: `https://www.youtube.com/tv?v=${v}` });
+    return c.req("ssap://system.launcher/launch", { id: "youtube.leanback.v4", params: { contentTarget: `https://www.youtube.com/tv?v=${v}` } });
   },
   // Typing goes into whichever text field has focus on the TV.
   text: async (c, t) => { if (!isStr(t, 500)) throw 400; return c.req("ssap://com.webos.service.ime/insertText", { text: t, replace: false }); },
